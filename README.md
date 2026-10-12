@@ -117,7 +117,7 @@ if [ ! -f keys.txt ]; then (umask 077 && : > keys.txt); fi
 chmod 600 keys.txt
 ${EDITOR:-vi} keys.txt
 
-# .env 中配置 OPENROUTER_API_KEY 与 MEMORYSUM_API_KEYS_FILE=keys.txt=keys.txt
+# .env 中配置 OPENROUTER_API_KEY 与 MEMORYSUM_API_KEYS_FILE=keys.txt
 export MEMORYSUM_HOST=0.0.0.0
 uv run memorysum
 ```

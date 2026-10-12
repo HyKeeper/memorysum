@@ -69,7 +69,7 @@ entry snapshot (Ecap)
 
 ## 当前已实现
 
-- AML Text/Coding 形状的同步 Add/Search、健康检查、Token/Bearer/X-Api-Key 入站鉴权、请求 body 容量上限与有界队列。
+- AML Text/Coding 形状的同步 Add/Search、健康检查、Bearer 入站鉴权、请求 body 容量上限与有界队列。
 - strict Pydantic 输入边界、user 隔离、request payload hash 幂等与冲突拒绝。
 - 双尺度、源消息内分块；消息跨度可精确回到原文。保留 role、原始 timestamp、assistant 回复。
 - OpenRouter dense embedding adapter、embedding batch 上限、向量校验/归一、input hash 去重、lease/fence、sqlite-vec 精确 KNN。
