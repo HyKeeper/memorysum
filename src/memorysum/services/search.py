@@ -61,7 +61,7 @@ class RerankEntry:
     candidate: FusedCandidate
     view_id: str
     content: str
-    span: dict[str, object]
+    spans: list[dict[str, object]]
     pair_proxy_tokens: int
 
 
@@ -463,27 +463,103 @@ class SearchService:
     @staticmethod
     def _load_window_rows(
         connection: sqlite3.Connection, window_ids: Sequence[int], epoch: int
-    ) -> dict[int, sqlite3.Row]:
+    ) -> dict[int, dict[str, object]]:
         if not window_ids:
             return {}
         placeholders = ",".join("?" for _ in window_ids)
-        rows = connection.execute(
-            f"""SELECT w.window_id, w.scale, w.message_id, w.start_char, w.end_char,
-                       w.input_id, w.published_epoch, m.public_source_id, m.request_id,
-                       m.ordinal AS message_ordinal, m.role, m.source_timestamp_ms, m.raw_content
+        ids = (*window_ids, epoch)
+        windows = connection.execute(
+            f"""SELECT w.window_id, w.scale, w.input_id, w.published_epoch,
+                       w.forced_split
                 FROM windows AS w
                 JOIN active_windows AS a ON a.window_id=w.window_id
-                JOIN messages AS m ON m.message_id=w.message_id
                 WHERE w.window_id IN ({placeholders}) AND a.published_epoch<=?
                 ORDER BY w.window_id""",
-            (*window_ids, epoch),
+            ids,
         ).fetchall()
-        return {int(row["window_id"]): row for row in rows}
+        span_rows = connection.execute(
+            f"""SELECT s.window_id, s.ordinal AS span_ordinal, s.message_id,
+                       s.start_char, s.end_char, m.public_source_id, m.request_id,
+                       m.ordinal AS message_ordinal, m.role, m.source_timestamp_ms,
+                       m.raw_content
+                FROM window_spans AS s
+                JOIN messages AS m ON m.message_id=s.message_id
+                WHERE s.window_id IN ({placeholders})
+                ORDER BY s.window_id, s.ordinal""",
+            window_ids,
+        ).fetchall()
+        spans_by_window: dict[int, list[dict[str, object]]] = {}
+        span_by_message: dict[tuple[int, int], dict[str, object]] = {}
+        for source in span_rows:
+            window_id = int(source["window_id"])
+            span = {
+                "span_ordinal": int(source["span_ordinal"]),
+                "message_id": int(source["message_id"]),
+                "start_char": int(source["start_char"]),
+                "end_char": int(source["end_char"]),
+                "public_source_id": str(source["public_source_id"]),
+                "request_id": str(source["request_id"]),
+                "message_ordinal": int(source["message_ordinal"]),
+                "role": str(source["role"]),
+                "source_timestamp_ms": source["source_timestamp_ms"],
+                "raw_content": str(source["raw_content"]),
+                "atoms": [],
+            }
+            spans_by_window.setdefault(window_id, []).append(span)
+            span_by_message[(window_id, int(source["message_id"]))] = span
+
+        atom_rows = connection.execute(
+            f"""SELECT wa.window_id, a.message_id, a.start_char, a.end_char,
+                       a.kind, a.in_code, a.in_quote
+                FROM window_atoms AS wa
+                JOIN atoms AS a ON a.atom_id=wa.atom_id
+                WHERE wa.window_id IN ({placeholders})
+                ORDER BY wa.window_id, a.message_id, a.start_char""",
+            window_ids,
+        ).fetchall()
+        for atom in atom_rows:
+            span = span_by_message.get((int(atom["window_id"]), int(atom["message_id"])))
+            if span is not None:
+                span["atoms"].append(
+                    {
+                        "start_char": int(atom["start_char"]),
+                        "end_char": int(atom["end_char"]),
+                        "kind": str(atom["kind"]),
+                        "in_code": bool(atom["in_code"]),
+                        "in_quote": bool(atom["in_quote"]),
+                    }
+                )
+
+        result: dict[int, dict[str, object]] = {}
+        for window in windows:
+            window_id = int(window["window_id"])
+            spans = spans_by_window.get(window_id, [])
+            if not spans:
+                continue
+            primary = spans[0]
+            result[window_id] = {
+                "window_id": window_id,
+                "scale": str(window["scale"]),
+                "input_id": int(window["input_id"]),
+                "published_epoch": int(window["published_epoch"]),
+                "forced_split": bool(window["forced_split"]),
+                "message_id": int(primary["message_id"]),
+                "start_char": int(primary["start_char"]),
+                "end_char": int(primary["end_char"]),
+                "public_source_id": str(primary["public_source_id"]),
+                "request_id": str(primary["request_id"]),
+                "message_ordinal": int(primary["message_ordinal"]),
+                "role": str(primary["role"]),
+                "source_timestamp_ms": primary["source_timestamp_ms"],
+                "raw_content": str(primary["raw_content"]),
+                "source_spans": spans,
+            }
+        return result
 
     def _group_overlapping_candidates(
         self,
         fused: Sequence[FusedCandidate],
-        rows: Mapping[int, sqlite3.Row],
+        rows: Mapping[int, dict[str, object]],
     ) -> list[CandidateGroup]:
         groups: list[CandidateGroup] = []
         for candidate in fused:
@@ -491,61 +567,81 @@ class SearchService:
             if source is None:
                 continue
             row = dict(source)
+            is_context = row["scale"] == "context"
+            token_limit = (
+                self._pipeline.groups.context_max_tokens
+                if is_context
+                else self._pipeline.groups.direct_max_tokens
+            )
+            source_spans = self._expand_spans_to_atoms(row["source_spans"], token_limit)
+            row["source_spans"] = source_spans
+            if not source_spans:
+                continue
+            primary = source_spans[0]
+            row.update(
+                message_id=int(primary["message_id"]),
+                start_char=int(primary["start_char"]),
+                end_char=int(primary["end_char"]),
+                public_source_id=str(primary["public_source_id"]),
+                role=str(primary["role"]),
+                source_timestamp_ms=primary["source_timestamp_ms"],
+                raw_content=str(primary["raw_content"]),
+            )
+
+            # Cross-message context windows are already bounded, ordered source
+            # groups. Keep them intact rather than merging unrelated windows.
+            if len(source_spans) > 1:
+                groups.append(CandidateGroup(candidate, row, True))
+                continue
+
             start = int(row["start_char"])
             end = int(row["end_char"])
-            is_context = row["scale"] == "context"
             overlapping = [
                 group
                 for group in groups
-                if int(group.row["message_id"]) == int(row["message_id"])
+                if group.contains_context_window is is_context
+                and len(group.row["source_spans"]) == 1
+                and int(group.row["message_id"]) == int(row["message_id"])
                 and start <= int(group.row["end_char"]) + 1
                 and end + 1 >= int(group.row["start_char"])
             ]
-
             if not overlapping:
                 groups.append(CandidateGroup(candidate, row, is_context))
                 continue
 
-            # Merge the entire connected source view only while it fits the
-            # frozen direct/context group budget. Never cut a source span.
             all_start = min(start, *(int(group.row["start_char"]) for group in overlapping))
             all_end = max(end, *(int(group.row["end_char"]) for group in overlapping))
-            has_context = is_context or any(group.contains_context_window for group in overlapping)
-            merged_row = {**row, "start_char": all_start, "end_char": all_end}
+            merged_span = {
+                **primary,
+                "start_char": all_start,
+                "end_char": all_end,
+            }
+            merged_row = self._row_with_spans(row, [merged_span])
             merged_content, _, _ = render_window(merged_row)
-            token_limit = (
-                self._pipeline.groups.context_max_tokens
-                if has_context
-                else self._pipeline.groups.direct_max_tokens
-            )
             if reader_token_count(merged_content) <= token_limit:
                 merged_candidate = self._merge_cpu_candidates(
                     [candidate, *(group.candidate for group in overlapping)]
                 )
                 groups = [group for group in groups if group not in overlapping]
-                groups.append(CandidateGroup(merged_candidate, merged_row, has_context))
+                groups.append(CandidateGroup(merged_candidate, merged_row, is_context))
                 continue
 
-            # If merging every touching group is too large, attach to the
-            # strongest single compatible group; otherwise retain a separate
-            # complete passage for reranking.
             attached = False
             for group in overlapping:
                 pair_start = min(start, int(group.row["start_char"]))
                 pair_end = max(end, int(group.row["end_char"]))
-                pair_context = is_context or group.contains_context_window
-                pair_row = {**row, "start_char": pair_start, "end_char": pair_end}
+                group_span = group.row["source_spans"][0]
+                pair_span = {
+                    **group_span,
+                    "start_char": pair_start,
+                    "end_char": pair_end,
+                }
+                pair_row = self._row_with_spans(group.row, [pair_span])
                 pair_content, _, _ = render_window(pair_row)
-                pair_limit = (
-                    self._pipeline.groups.context_max_tokens
-                    if pair_context
-                    else self._pipeline.groups.direct_max_tokens
-                )
-                if reader_token_count(pair_content) > pair_limit:
+                if reader_token_count(pair_content) > token_limit:
                     continue
                 group.row = pair_row
                 group.candidate = self._merge_cpu_candidates([group.candidate, candidate])
-                group.contains_context_window = pair_context
                 attached = True
                 break
             if not attached:
@@ -560,6 +656,41 @@ class SearchService:
             ),
         )
 
+    def _expand_spans_to_atoms(
+        self, source_spans: Sequence[object], token_limit: int
+    ) -> list[dict[str, object]]:
+        original = [dict(span) for span in source_spans]
+        expanded: list[dict[str, object]] = []
+        for span in original:
+            atoms = span.get("atoms", [])
+            start = int(span["start_char"])
+            end = int(span["end_char"])
+            if atoms:
+                start = min(start, *(int(atom["start_char"]) for atom in atoms))
+                end = max(end, *(int(atom["end_char"]) for atom in atoms))
+            expanded.append({**span, "start_char": start, "end_char": end})
+
+        if reader_token_count(render_window({"source_spans": expanded})[0]) <= token_limit:
+            return expanded
+        return original
+
+    @staticmethod
+    def _row_with_spans(
+        row: Mapping[str, object], spans: list[dict[str, object]]
+    ) -> dict[str, object]:
+        primary = spans[0]
+        return {
+            **row,
+            "source_spans": spans,
+            "message_id": int(primary["message_id"]),
+            "start_char": int(primary["start_char"]),
+            "end_char": int(primary["end_char"]),
+            "public_source_id": str(primary["public_source_id"]),
+            "role": str(primary["role"]),
+            "source_timestamp_ms": primary["source_timestamp_ms"],
+            "raw_content": str(primary["raw_content"]),
+        }
+
     @staticmethod
     def _merge_cpu_candidates(candidates: Sequence[FusedCandidate]) -> FusedCandidate:
         return FusedCandidate(
@@ -572,7 +703,7 @@ class SearchService:
     def _prepare_rerank_entries(
         self,
         fused: Sequence[FusedCandidate],
-        rows: Mapping[int, sqlite3.Row],
+        rows: Mapping[int, dict[str, object]],
         request: SearchRequest,
         options: Sequence[str],
         wide_mode: bool,
@@ -592,7 +723,7 @@ class SearchService:
         groups = self._group_overlapping_candidates(fused, rows)
         for group in groups:
             candidate = group.candidate
-            content, view_id, span = render_window(group.row)
+            content, view_id, spans = render_window(group.row)
             pair_text = (
                 f"<Instruct>: {self._pipeline.reranker.instruction}\n"
                 f"<Query>: {rerank_question}\n<Document>: {content}"
@@ -604,7 +735,7 @@ class SearchService:
                     candidate=candidate,
                     view_id=view_id,
                     content=content,
-                    span=span,
+                    spans=spans,
                     pair_proxy_tokens=pair_cost,
                 )
 
@@ -716,17 +847,25 @@ class SearchService:
         for entry, _score in ranked:
             if len(selected) >= max_records:
                 break
-            start = int(entry.span["start_char"])
-            end = int(entry.span["end_char"])
-            source_id = str(entry.span["source_id"])
-            if any(start >= left and end <= right for left, right in covered.get(source_id, [])):
+            spans = entry.spans
+            already_covered = all(
+                any(
+                    int(span["start_char"]) >= left and int(span["end_char"]) <= right
+                    for left, right in covered.get(str(span["source_id"]), [])
+                )
+                for span in spans
+            )
+            if already_covered:
                 continue
             cost = reader_token_count(entry.content) + _RENDER_TOKEN_OVERHEAD
             if spent + cost > memory_budget:
                 continue
             selected.append(SearchItem(id=entry.view_id, content=entry.content))
             spent += cost
-            covered.setdefault(source_id, []).append((start, end))
+            for span in spans:
+                covered.setdefault(str(span["source_id"]), []).append(
+                    (int(span["start_char"]), int(span["end_char"]))
+                )
         return SearchResponse(data=selected)
 
     def _rerank_query(self, query: str, options: Sequence[str]) -> str:

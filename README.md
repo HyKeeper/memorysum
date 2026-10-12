@@ -2,7 +2,7 @@
 
 面向记忆检索系统开发的原文记忆服务，提供与 AML Text Add / Search 兼容的 API 形状。当前仓库侧重本机开发与真实服务链路验证，不代表任何比赛成绩。
 
-> **当前算法版本：`memorysum-openrouter-preview-v0.1.0`（provisional）**
+> **当前算法版本：`memorysum-openrouter-preview-v0.2.0`（provisional）**
 > 本地开发暂用 OpenRouter 的 `liquid/lfm-2.5-embedding-350m:free` 与 `nvidia/llama-nemotron-rerank-vl-1b-v2:free`。免费路由的可用性、吞吐与数据处理条款尚未完成正式评估。冻结规格要求的 text-embedding-v4 512 维稠密+稀疏向量、Qwen3-Reranker 官方模板/tokenizer 校验尚未接入。因此配置会自动探测维度、稀疏通道关闭、pair tokens 使用 `cl100k_base` 估算，不能把当前版本描述成已通过正式模型验收。
 
 ## 实现原则
@@ -88,10 +88,10 @@ curl -sS http://127.0.0.1:8001/search \
 ## 当前垂直链路
 
 1. 严格校验 AML 文本 Add / Search 字段、消息角色、时间戳和容量边界。
-2. 以确定性 embedding-token 代理构造 leaf/context 双尺度窗口，保存精确原文 span。
+2. 以确定性 embedding-token 代理构造 leaf/context 双尺度窗口；句子、标题、列表、表格、代码和引用会映射为精确原文 atom，context 窗口只在同一 Add 请求中按源序跨消息组合，最多 4 个 source spans。
 3. OpenRouter embedding 批量请求；校验 vector 个数、维度、finite/norm，并按 float32 归一化存入 `sqlite-vec`。
 4. SQLite FTS5 英文词法 + Jieba/中文 bigram 词法与双尺度 dense 召回，按 RRF 排名；options 作为受限词法提名。
-5. 合并相同消息中可装入组预算的相交窗口，再经 OpenRouter rerank；任何批次失败都不返回部分排序。
+5. 对同消息相交窗口合并；跨消息 context groups 保留清晰 span 边界并受窗口数限制，再经 OpenRouter rerank；任何批次失败都不返回部分排序。
 6. 小空间满足完整渲染 gate 时返回完整原文 bundle，不做“前缀全文”；普通检索按完整证据组与 prompt 预算选择输出。
 7. 新 Add 通过入口 epoch 与原子发布隔离；用户数据从首次接收起 30 天固定 TTL，过期后退休并清理 SQLite/WAL/SHM。
 

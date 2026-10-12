@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Sequence
 
 from memorysum.api.schemas import AddRequest, AddResponse
-from memorysum.core.chunking import WindowDraft, build_windows
+from memorysum.core.chunking import IngestPlan, build_ingest_plan
 from memorysum.core.errors import (
     AddInProgress,
     PipelineMismatch,
@@ -58,9 +58,10 @@ class AddService:
         owner = uuid.uuid4().hex
         digest = request.payload_digest()
         deadline = time.monotonic() + self._pipeline.capacity.add_deadline_seconds
-        drafts = build_windows(
+        plan = build_ingest_plan(
             [(message.role, message.content) for message in request.messages], self._pipeline
         )
+        drafts = list(plan.windows)
         render_estimates = [
             message_token_estimate(
                 source_id(request.user_id, request.request_id, ordinal),
@@ -75,6 +76,7 @@ class AddService:
                 leaf_windows=sum(window.scale == "leaf" for window in drafts),
                 context_windows=sum(window.scale == "context" for window in drafts),
                 unique_document_inputs=len({window.embedding_text for window in drafts}),
+                atoms=len(plan.atoms),
             )
         if not drafts:
             raise ServiceError(
@@ -83,9 +85,7 @@ class AddService:
 
         with self._database.scope_lock(reference.scope_key):
             self._database.assert_scope_active(request.user_id)
-            staged = self._stage_request(
-                reference, request, digest, drafts, render_estimates, owner
-            )
+            staged = self._stage_request(reference, request, digest, plan, render_estimates, owner)
             if isinstance(staged, AddResponse):
                 return staged
             fence = staged
@@ -124,7 +124,7 @@ class AddService:
         reference: ScopeRef,
         request: AddRequest,
         digest: bytes,
-        drafts: list[WindowDraft],
+        plan: IngestPlan,
         render_estimates: Sequence[int],
         owner: str,
     ) -> int | AddResponse:
@@ -166,7 +166,7 @@ class AddService:
                         ).fetchone()[0]
                     )
                     if staged_count == 0:
-                        self._insert_staged_sources(connection, request, drafts, render_estimates)
+                        self._insert_staged_sources(connection, request, plan, render_estimates)
                     elif staged_count != len(request.messages):
                         raise StorageError()
                     window_count = int(
@@ -193,7 +193,7 @@ class AddService:
                         now,
                     ),
                 )
-                self._insert_staged_sources(connection, request, drafts, render_estimates)
+                self._insert_staged_sources(connection, request, plan, render_estimates)
                 return 1
         except (RequestConflict, AddInProgress, ScopeRetired, StorageError):
             raise
@@ -207,7 +207,7 @@ class AddService:
         self,
         connection,
         request: AddRequest,
-        drafts: list[WindowDraft],
+        plan: IngestPlan,
         render_estimates: Sequence[int],
     ) -> None:
         message_ids: dict[int, int] = {}
@@ -232,7 +232,26 @@ class AddService:
             )
             message_ids[ordinal] = int(cursor.lastrowid)
 
-        for draft in drafts:
+        atom_ids: dict[tuple[int, int], int] = {}
+        for atom in plan.atoms:
+            cursor = connection.execute(
+                """INSERT INTO atoms(
+                       message_id, ordinal, start_char, end_char, raw_hash, kind, in_code, in_quote
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    message_ids[atom.message_ordinal],
+                    atom.ordinal,
+                    atom.start_char,
+                    atom.end_char,
+                    atom.raw_hash,
+                    atom.kind,
+                    int(atom.in_code),
+                    int(atom.in_quote),
+                ),
+            )
+            atom_ids[(atom.message_ordinal, atom.ordinal)] = int(cursor.lastrowid)
+
+        for draft in plan.windows:
             input_hash = hashlib.sha256(draft.embedding_text.encode("utf-8")).digest()
             connection.execute(
                 """INSERT INTO embedding_inputs(
@@ -252,24 +271,46 @@ class AddService:
             ).fetchone()
             if input_row is None or input_row["input_text"] != draft.embedding_text:
                 raise PipelineMismatch()
-            connection.execute(
+            primary_span = draft.source_spans[0]
+            cursor = connection.execute(
                 """INSERT INTO windows(
                        request_id, ordinal, scale, message_id, input_id,
-                       start_char, end_char, proxy_token_count, lexical_en, lexical_zh
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       start_char, end_char, proxy_token_count, lexical_en, lexical_zh,
+                       forced_split
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     request.request_id,
                     draft.ordinal,
                     draft.scale,
                     message_ids[draft.message_ordinal],
                     int(input_row["input_id"]),
-                    draft.start_char,
-                    draft.end_char,
+                    primary_span.start_char,
+                    primary_span.end_char,
                     draft.proxy_token_count,
                     draft.lexical_en,
                     draft.lexical_zh,
+                    int(draft.forced_split),
                 ),
             )
+            window_id = int(cursor.lastrowid)
+            for span_ordinal, span in enumerate(draft.source_spans):
+                connection.execute(
+                    """INSERT INTO window_spans(
+                           window_id, ordinal, message_id, start_char, end_char
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        window_id,
+                        span_ordinal,
+                        message_ids[span.message_ordinal],
+                        span.start_char,
+                        span.end_char,
+                    ),
+                )
+            for atom_ref in draft.atom_refs:
+                connection.execute(
+                    "INSERT OR IGNORE INTO window_atoms(window_id, atom_id) VALUES (?, ?)",
+                    (window_id, atom_ids[atom_ref]),
+                )
 
     def _ensure_embeddings(
         self,

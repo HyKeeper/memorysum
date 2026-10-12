@@ -52,6 +52,21 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_request_order ON messages(request_id, ordinal);
 CREATE INDEX IF NOT EXISTS messages_source_time ON messages(source_timestamp_ms, message_id);
 
+CREATE TABLE IF NOT EXISTS atoms (
+    atom_id INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES messages(message_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    start_char INTEGER NOT NULL CHECK (start_char >= 0),
+    end_char INTEGER NOT NULL CHECK (end_char > start_char),
+    raw_hash BLOB NOT NULL CHECK (length(raw_hash) = 32),
+    kind TEXT NOT NULL,
+    in_code INTEGER NOT NULL DEFAULT 0 CHECK (in_code IN (0, 1)),
+    in_quote INTEGER NOT NULL DEFAULT 0 CHECK (in_quote IN (0, 1)),
+    UNIQUE(message_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS atoms_message ON atoms(message_id, start_char, end_char);
+CREATE INDEX IF NOT EXISTS atoms_exact ON atoms(raw_hash, atom_id);
+
 CREATE TABLE IF NOT EXISTS embedding_inputs (
     input_id INTEGER PRIMARY KEY,
     embedding_space_id TEXT NOT NULL,
@@ -87,6 +102,7 @@ CREATE TABLE IF NOT EXISTS windows (
     proxy_token_count INTEGER NOT NULL CHECK (proxy_token_count > 0),
     lexical_en TEXT NOT NULL DEFAULT '',
     lexical_zh TEXT NOT NULL DEFAULT '',
+    forced_split INTEGER NOT NULL DEFAULT 0 CHECK (forced_split IN (0, 1)),
     published_epoch INTEGER,
     UNIQUE(request_id, message_id, scale, ordinal),
     UNIQUE(window_id, input_id, scale)
@@ -94,6 +110,23 @@ CREATE TABLE IF NOT EXISTS windows (
 CREATE INDEX IF NOT EXISTS windows_request ON windows(request_id, scale, ordinal);
 CREATE INDEX IF NOT EXISTS windows_message_span ON windows(message_id, start_char, end_char);
 CREATE INDEX IF NOT EXISTS windows_published ON windows(published_epoch, scale, window_id);
+
+CREATE TABLE IF NOT EXISTS window_spans (
+    window_id INTEGER NOT NULL REFERENCES windows(window_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    message_id INTEGER NOT NULL REFERENCES messages(message_id),
+    start_char INTEGER NOT NULL CHECK (start_char >= 0),
+    end_char INTEGER NOT NULL CHECK (end_char > start_char),
+    PRIMARY KEY(window_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS window_spans_source ON window_spans(message_id, start_char, end_char);
+
+CREATE TABLE IF NOT EXISTS window_atoms (
+    window_id INTEGER NOT NULL REFERENCES windows(window_id),
+    atom_id INTEGER NOT NULL REFERENCES atoms(atom_id),
+    PRIMARY KEY(window_id, atom_id)
+);
+CREATE INDEX IF NOT EXISTS atom_windows ON window_atoms(atom_id, window_id);
 
 CREATE TABLE IF NOT EXISTS active_windows (
     window_id INTEGER PRIMARY KEY,

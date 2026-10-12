@@ -162,7 +162,51 @@ def test_long_scope_uses_retrieval_and_reranker(tmp_path):
         assert len(provider.rerank_batches) == rerank_count
 
 
-def test_authentication_and_zero_top_k(tmp_path):
+def test_search_reranks_bounded_context_groups_across_messages(tmp_path):
+    provider = FakeProvider()
+    app = make_app(tmp_path / "data", provider)
+    filler = (
+        "The team reviewed design decisions, meeting outcomes, deployment schedules, owners, "
+        "due dates, and open questions. " * 8
+    )
+    messages = []
+    for index in range(60):
+        fact = "The project codename is Amber Finch. " if index == 23 else ""
+        messages.append(
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"Record {index:03d}. {fact}{filler}",
+            }
+        )
+
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        added = client.post(
+            "/add",
+            json={
+                "request_id": "context-add",
+                "user_id": "context-user",
+                "session_id": "context-session",
+                "messages": messages,
+            },
+        )
+        assert added.status_code == 200
+        searched = client.post(
+            "/search",
+            json={
+                "query": "What is the project codename?",
+                "user_id": "context-user",
+                "top_k": 10,
+            },
+        )
+
+    assert searched.status_code == 200
+    assert provider.rerank_batches
+    reranked_documents = [
+        document for _query, documents in provider.rerank_batches for document in documents
+    ]
+    assert any("Adjacent source span" in document for document in reranked_documents)
+    assert any("Amber Finch" in document for document in reranked_documents)
+
     app = make_app(tmp_path / "data", FakeProvider())
     with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
         unauthorized = client.post(

@@ -12,7 +12,8 @@ api/app.py
   └── storage/database.py        # user_id 路由、SQLite 生命周期、sqlite-vec
 
 core/
-  ├── chunking.py                # 原文精确 span + 双尺度窗口
+  ├── chunking.py                # 原文精确 span + 双尺度/跨消息 bounded context 窗口
+  ├── atoms.py                   # 句子、标题、列表、表格、代码/引用的原文 atom
   ├── identity.py                # payload/source/scope/view 稳定身份
   ├── ranking.py                 # deterministic RRF
   ├── rendering.py               # 原文证据输出与 reader-token 估算
@@ -71,7 +72,8 @@ entry snapshot (Ecap)
 
 - AML Text/Coding 形状的同步 Add/Search、健康检查、Bearer 入站鉴权、请求 body 容量上限与有界队列。
 - strict Pydantic 输入边界、user 隔离、request payload hash 幂等与冲突拒绝。
-- 双尺度、源消息内分块；消息跨度可精确回到原文。保留 role、原始 timestamp、assistant 回复。
+- 双尺度 leaf/context 窗口；source atom 保留 Python Unicode 半开区间、kind、code/quote 标记及 raw hash；`window_spans` / `window_atoms` 回连原文。
+- context 窗口只跨同一 Add 请求内的消息源序，最多 4 spans；rerank 前可在组预算内扩回完整 atom，超预算则保留原窗口。
 - OpenRouter dense embedding adapter、embedding batch 上限、向量校验/归一、input hash 去重、lease/fence、sqlite-vec 精确 KNN。
 - FTS5 英文 + Jieba/中文 bigram，options lexical 提名，固定 RRF，bounded rerank 批次。
 - 小 scope 完整 bundle gate、reader-token 估算预算、source-span 稳定 ID、epoch、物理 30 天 TTL。
@@ -80,10 +82,10 @@ entry snapshot (Ecap)
 ## 下一阶段开发项
 
 1. **模型合同**：当前 embedding provider 仅提供 dense vector，维度自动发现；没有原生 sparse postings。reranker 是临时 VL 模型，无法核对冻结版要求的 Qwen3 tokenizer、官方 yes/no pair template SHA 与 24k/48k 的精确真实 token 数。现在使用 `cl100k_base` 代理数，故配置明确为 `provisional`。
-2. **召回扩展**：尚未实现 atom/sentence/table/header 结构链接、同 request 跨消息 context windows、时间变化桶、唯一目标 revision 边、embedded-dialogue 检测、个人偏好保底及扩展配额。
-3. **写入任务优化**：SQLite 已按 input hash 保存 embedding 状态，但还没有跨进程输入级 single-flight worker pool，也没有 query 同 key 并发 single-flight。
-4. **输出分组**：已合并相交窗口并限制 rerank group 大小；完整 `atoms` 映射、跨消息最多 4 spans 的上下文 group、oversize 原子策略尚未实现。
-5. **容量验证**：尚未做 1k/10k/50k/100k scope 的 p50/p95、100k DB bytes 外推、Full 吞吐、外部供应商配额与固定提交/依赖锁验收。不能宣称支持 600M 源 tokens 或符合正式吞吐目标。
-6. **发行验收**：尚未完成真实模型 pair fixture、正式 Smoke、并发/崩溃/回滚完整故障注入与公开方法卡。
+2. **结构关系**：heading/table/list/exception/explicit-reference links 尚未建；atom kind 已保存但还没有 relation-aware 召回，embedded-dialogue attribution 识别也未实现。
+3. **时间与修订**：时间戳已保存与展示，但还没有 temporal candidate buckets 或 strict asserted-revision edges；自动 truth supersede/forget 仍保持关闭。
+4. **个性化归因**：`is_personal_query` 检测函数已存在但未接入 Search；direct-user-form 候选保底和 embedded-dialogue 防误归因尚未实现。
+5. **写入任务优化**：SQLite 已按 input hash 保存 embedding 状态，但还没有跨进程输入级 single-flight worker pool，也没有 query 同 key 并发 single-flight。
+6. **输出组与容量**：跨消息 groups 已限制到 4 spans 并扩展 parent atoms；完整 structure paths、oversize atom 的显式 omission telemetry 尚未完成。还没有 1k/10k/50k/100k scope p50/p95、100k DB bytes 外推、Full 吞吐或供应商配额压测。
 
 继续对齐 Champion v1 规格前，需要先补齐并验证这些项目；本仓当前作为本地开发原型运行。

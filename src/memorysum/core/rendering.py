@@ -7,8 +7,9 @@ from collections.abc import Mapping, Sequence
 from memorysum.core.identity import stable_view_id
 from memorysum.core.text import reader_token_count, utc_timestamp
 
-RENDERER_VERSION = "memorysum-source-render-v1"
+RENDERER_VERSION = "memorysum-source-render-v2"
 FULL_BUNDLE_SEPARATOR = "\n\n---\n\n"
+CONTEXT_SPAN_SEPARATOR = "\n\n--- Adjacent source span ---\n\n"
 
 
 def render_message(source_id: str, role: str, timestamp_ms: int | None, content: str) -> str:
@@ -55,23 +56,43 @@ def render_full_bundle(messages: Sequence[Mapping[str, object]]) -> tuple[str, s
     return FULL_BUNDLE_SEPARATOR.join(blocks), stable_view_id(RENDERER_VERSION, spans)
 
 
-def render_window(window: Mapping[str, object]) -> tuple[str, str, dict[str, object]]:
-    raw_content = str(window["raw_content"])
-    start = int(window["start_char"])
-    end = int(window["end_char"])
-    passage = raw_content[start:end]
-    if not passage or raw_content[start:end] != passage:
-        raise ValueError("window span does not map to its immutable source message")
-    source = str(window["public_source_id"])
-    span = {
-        "source_id": source,
-        "start_char": start,
-        "end_char": end,
-    }
-    content = render_message(
-        "msg_" + source[:16],
-        str(window["role"]),
-        window["source_timestamp_ms"],  # type: ignore[arg-type]
-        passage,
+def render_source_spans(
+    spans: Sequence[Mapping[str, object]],
+) -> tuple[str, str, list[dict[str, object]]]:
+    if not spans:
+        raise ValueError("An evidence view must include at least one source span")
+
+    blocks: list[str] = []
+    identities: list[dict[str, object]] = []
+    for span in spans:
+        raw_content = str(span["raw_content"])
+        start = int(span["start_char"])
+        end = int(span["end_char"])
+        passage = raw_content[start:end]
+        if not passage or raw_content[start:end] != passage:
+            raise ValueError("window span does not map to its immutable source message")
+        source = str(span["public_source_id"])
+        identities.append({"source_id": source, "start_char": start, "end_char": end})
+        blocks.append(
+            render_message(
+                "msg_" + source[:16],
+                str(span["role"]),
+                span["source_timestamp_ms"],  # type: ignore[arg-type]
+                passage,
+            )
+        )
+    return (
+        CONTEXT_SPAN_SEPARATOR.join(blocks),
+        stable_view_id(RENDERER_VERSION, identities),
+        identities,
     )
-    return content, stable_view_id(RENDERER_VERSION, [span]), span
+
+
+def render_window(
+    window: Mapping[str, object],
+) -> tuple[str, str, list[dict[str, object]]]:
+    source_spans = window.get("source_spans")
+    if isinstance(source_spans, Sequence) and not isinstance(source_spans, (str, bytes)):
+        if source_spans:
+            return render_source_spans(source_spans)  # type: ignore[arg-type]
+    return render_source_spans([window])

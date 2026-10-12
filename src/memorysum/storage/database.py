@@ -20,7 +20,7 @@ from memorysum.settings import PipelineConfig
 
 logger = logging.getLogger(__name__)
 _GIB = 1024**3
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
