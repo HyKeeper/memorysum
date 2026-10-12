@@ -1,5 +1,5 @@
 {
-  "pipeline_id": "memorysum-openrouter-preview-v0.2.0",
+  "pipeline_id": "memorysum-openrouter-preview-v0.3.0",
   "qualification_status": "provisional",
   "language": "textual",
   "generation_enabled": false,
@@ -31,7 +31,7 @@
   "chunking": {
     "token_proxy": "unicode-word-cjk-char-punctuation-v1",
     "leaf": {"min": 128, "target": 256, "max": 320, "overlap": 64},
-    "context": {"min": 384, "target": 768, "max": 1024, "overlap": 192}
+    "context": {"min": 128, "target": 320, "max": 384, "overlap": 64}
   },
   "retrieval": {
     "rrf_k": 60,

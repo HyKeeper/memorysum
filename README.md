@@ -2,8 +2,8 @@
 
 面向记忆检索系统开发的原文记忆服务，提供与 AML Text Add / Search 兼容的 API 形状。当前仓库侧重本机开发与真实服务链路验证，不代表任何比赛成绩。
 
-> **当前算法版本：`memorysum-openrouter-preview-v0.2.0`（provisional）**
-> 本地开发暂用 OpenRouter 的 `liquid/lfm-2.5-embedding-350m:free` 与 `nvidia/llama-nemotron-rerank-vl-1b-v2:free`。免费路由的可用性、吞吐与数据处理条款尚未完成正式评估。冻结规格要求的 text-embedding-v4 512 维稠密+稀疏向量、Qwen3-Reranker 官方模板/tokenizer 校验尚未接入。因此配置会自动探测维度、稀疏通道关闭、pair tokens 使用 `cl100k_base` 估算，不能把当前版本描述成已通过正式模型验收。
+> **当前算法版本：`memorysum-openrouter-preview-v0.3.0`（provisional）**
+> 本地开发暂用 OpenRouter 的 `liquid/lfm-2.5-embedding-350m:free` 与 `nvidia/llama-nemotron-rerank-vl-1b-v2:free`。免费路由的可用性、吞吐与数据处理条款尚未完成正式评估。冻结规格要求的 text-embedding-v4 512 维稠密+稀疏向量、Qwen3-Reranker 官方模板/tokenizer 校验尚未接入。因此配置会自动探测维度、关闭 sparse，并使用 `cl100k_base` 估算 rerank pair tokens。为适配临时 LFM 路由，context 窗口暂缩为 target 320 / max 384 proxy tokens，和冻结 Champion v1 的窗口参数不同；当前版本不能描述成已通过正式模型验收。
 
 ## 实现原则
 
