@@ -1,0 +1,101 @@
+{
+  "pipeline_id": "memorysum-openrouter-preview-v0.1.0",
+  "qualification_status": "provisional",
+  "language": "textual",
+  "generation_enabled": false,
+  "embedding": {
+    "provider": "openrouter",
+    "model": "liquid/lfm-2.5-embedding-350m:free",
+    "dimension": "auto-detect-on-first-successful-embedding",
+    "query_instruction": "Retrieve original memory passages relevant to this question, including necessary entities, dates, preferences, conditions, and exceptions.",
+    "document_instruction": null,
+    "batch_items": 10,
+    "batch_proxy_tokens": 8192,
+    "input_proxy_tokens": 4096,
+    "sparse_output": false
+  },
+  "reranker": {
+    "provider": "openrouter",
+    "model": "nvidia/llama-nemotron-rerank-vl-1b-v2:free",
+    "instruction": "Retrieve original memory evidence relevant to the question and all provided options, including necessary context, dates, conditions, and exceptions.",
+    "tokenizer": "cl100k_base",
+    "tokenizer_is_approximate": true,
+    "single_pair_proxy_tokens": 8192,
+    "ordinary_pair_proxy_budget": 24000,
+    "wide_pair_proxy_budget": 48000,
+    "ordinary_candidate_groups": 64,
+    "wide_candidate_groups": 100,
+    "batch_groups": 16,
+    "max_concurrency": 2
+  },
+  "chunking": {
+    "token_proxy": "unicode-word-cjk-char-punctuation-v1",
+    "leaf": {"min": 128, "target": 256, "max": 320, "overlap": 64},
+    "context": {"min": 384, "target": 768, "max": 1024, "overlap": 192}
+  },
+  "retrieval": {
+    "rrf_k": 60,
+    "base_channel_weight": 1.0,
+    "ordinary": {
+      "leaf_dense": 96,
+      "context_dense": 48,
+      "english_fts": 80,
+      "chinese_fts": 24,
+      "options_lexical": 16,
+      "candidate_cap": 384,
+      "output_records": 64,
+      "output_tokens": 32768
+    },
+    "wide": {
+      "leaf_dense": 128,
+      "context_dense": 64,
+      "english_fts": 96,
+      "chinese_fts": 32,
+      "options_lexical": 16,
+      "candidate_cap": 512,
+      "output_records": 100,
+      "output_tokens": 49152
+    },
+    "unused_quota_transfer": false,
+    "sparse_channel": "disabled-by-provisional-embedding-provider"
+  },
+  "groups": {
+    "max_spans": 4,
+    "direct_max_tokens": 640,
+    "context_max_tokens": 1536
+  },
+  "coverage": {
+    "always_full_tokens": 4096,
+    "conditional_full_tokens": 32768,
+    "conditional_full_requires_wide_or_context_mode": true,
+    "safe_input_tokens": 96000,
+    "estimation_safety_factor": 1.25,
+    "platform_instruction_reserve": 8192,
+    "reader_estimator": "cl100k_base"
+  },
+  "capacity": {
+    "max_body_bytes": 33554432,
+    "max_add_messages": 1024,
+    "max_search_options": 32,
+    "add_concurrency": 4,
+    "search_concurrency": 2,
+    "interface_queue": 32,
+    "add_deadline_seconds": 900,
+    "search_deadline_seconds": 180,
+    "model_request_timeout_seconds": 60,
+    "model_request_attempts": 3,
+    "scope_retention_days": 30,
+    "cleanup_interval_seconds": 3600,
+    "wal_autocheckpoint_pages": 1000
+  },
+  "features": {
+    "automatic_truth_supersede": false,
+    "automatic_forget": false,
+    "generation": false,
+    "seed_rerank": false,
+    "semantic_probe": false,
+    "option_dense": false,
+    "ann": false,
+    "cross_request_order_inference": false
+  }
+}

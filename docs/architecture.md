@@ -1,0 +1,89 @@
+# 架构与实现状态
+
+## 依赖方向
+
+```text
+api/app.py
+  ├── api/schemas.py             # HTTP/Pydantic 契约
+  ├── services/add.py            # Add 生命周期与原子发布
+  ├── services/search.py         # 可见 epoch、召回、rerank、输出预算
+  ├── providers/protocols.py     # embedding/rerank 接口
+  │     └── providers/openrouter.py
+  └── storage/database.py        # user_id 路由、SQLite 生命周期、sqlite-vec
+
+core/
+  ├── chunking.py                # 原文精确 span + 双尺度窗口
+  ├── identity.py                # payload/source/scope/view 稳定身份
+  ├── ranking.py                 # deterministic RRF
+  ├── rendering.py               # 原文证据输出与 reader-token 估算
+  ├── query_modes.py             # 固定英文/中文 wide/context 触发词
+  ├── text.py                    # proxy tokenizer、jieba、cl100k 计数
+  ├── vector.py                  # L2 normalization / float32 blob
+  └── cache.py                   # 有界进程内 TTL/LRU
+```
+
+业务层不拼 OpenRouter URL，不直接生成回答；provider 层不访问 SQLite；存储层不知道 rerank 策略。新增实际供应商时，增加 `ModelProvider` 实现并在 app wiring 中替换，不把供应商字段散落进 Add/Search 代码。
+
+## Add 状态流
+
+```text
+validate exact payload
+  → hash(user scope + request payload)
+  → register request/build fence
+  → persist immutable messages + unpublished windows + embedding inputs
+  → claim pending inputs (lease/fence)
+  → call embedding API outside SQL transaction
+  → persist normalized vectors
+  → one short publication transaction:
+       vec rows + both FTS rowids + active_windows + counts
+       + request receipt + active_epoch + full-render estimates
+  → HTTP 200
+```
+
+失败的 Add 不会发布窗口；staging 与 retry 状态保留，重发同一请求可恢复。不同 payload 复用已用 `request_id` 返回 422。scope DB 中的每个 embedding input 按 `(embedding_space_id, input_hash)` 去重；外部模型调用不承诺 exactly-once。
+
+## Search 可见性
+
+```text
+entry snapshot (Ecap)
+  ├── complete-render gate → one complete raw-memory bundle, or
+  └── query embedding → dense leaf/context + English/Chinese FTS + options FTS
+                     → RRF → source-span grouping → rerank
+                     → whole-record token budget → final scope guard
+```
+
+向量 KNN 查询在 SQLite vec0 metadata 条件中直接限制 `published_epoch <= Ecap`；FTS、全文 bundle 与回源窗口同样按 ready request / active epoch 过滤。模型 API 等待期间发布的新 Add 不会进入本次 Search。原文读取事务在 rerank 前结束，scope 最后再做一次生命周期校验。
+
+## 持久化与生命周期
+
+- 全局 `registry.sqlite3` 只存 `sha256(user_id)`、pipeline、first-seen、expiry 与 scope 状态；每个用户 DB 的 `scope_manifest` 保存精确 `user_id`，防止哈希路由误用。
+- user 数据文件为 `data/scopes/<scope_sha256>.sqlite3`；WAL + `synchronous=FULL`，scope/filesystem 权限尽量收紧。
+- 数据 TTL 固定 30 天，不因活动续期。退休先将 registry 置为 `retired`，等待活动 SQLite connection leases 关闭，再删除 DB/WAL/SHM；registry tombstone 留存，阻止同一 user ID 复活。
+- 外部请求不在 SQL 写事务期间执行。Search response cache、query-vector cache 与 full-bundle cache 均有界，cache key 含 scope hash；退休时清理对应 cache。
+- 当前运行形态是单服务副本、Uvicorn `workers=1`，HTTP 端口固定 `8001`。scope connection leases 与 cache retirement 以单进程为协调边界；多副本共享 SQLite 数据目录尚未实现，不应直接横向扩容。
+- `MEMORYSUM_DEBUG` 默认关闭；本机设为 true 时记录完整 Add/Search JSON 到 stdout，包含消息正文、问题、options 和 payload IDs。请求 headers 与 API credentials 永不写日志。调试日志可能包含敏感正文，不应共享或长期保留。
+
+## 版本边界
+
+`src/memorysum/config/champion-v1.json` 是算法配置唯一来源。`pipeline_id` 和数据库 `PRAGMA user_version` 用来拒绝无迁移的旧数据。改变以下任意项都应新建 pipeline/schema 版本，不能在同一 scope 中混用：embedding provider/model/instruction/dimension、chunk/window renderer、索引格式、reranker 评分模板。
+
+## 当前已实现
+
+- AML Text/Coding 形状的同步 Add/Search、健康检查、Token/Bearer/X-Api-Key 入站鉴权、请求 body 容量上限与有界队列。
+- strict Pydantic 输入边界、user 隔离、request payload hash 幂等与冲突拒绝。
+- 双尺度、源消息内分块；消息跨度可精确回到原文。保留 role、原始 timestamp、assistant 回复。
+- OpenRouter dense embedding adapter、embedding batch 上限、向量校验/归一、input hash 去重、lease/fence、sqlite-vec 精确 KNN。
+- FTS5 英文 + Jieba/中文 bigram，options lexical 提名，固定 RRF，bounded rerank 批次。
+- 小 scope 完整 bundle gate、reader-token 估算预算、source-span 稳定 ID、epoch、物理 30 天 TTL。
+- SQLite vec0 / FTS5 本地启动 probe；fake provider 下的 API、幂等、隔离、检索、缓存与退休测试。
+
+## 下一阶段开发项
+
+1. **模型合同**：当前 embedding provider 仅提供 dense vector，维度自动发现；没有原生 sparse postings。reranker 是临时 VL 模型，无法核对冻结版要求的 Qwen3 tokenizer、官方 yes/no pair template SHA 与 24k/48k 的精确真实 token 数。现在使用 `cl100k_base` 代理数，故配置明确为 `provisional`。
+2. **召回扩展**：尚未实现 atom/sentence/table/header 结构链接、同 request 跨消息 context windows、时间变化桶、唯一目标 revision 边、embedded-dialogue 检测、个人偏好保底及扩展配额。
+3. **写入任务优化**：SQLite 已按 input hash 保存 embedding 状态，但还没有跨进程输入级 single-flight worker pool，也没有 query 同 key 并发 single-flight。
+4. **输出分组**：已合并相交窗口并限制 rerank group 大小；完整 `atoms` 映射、跨消息最多 4 spans 的上下文 group、oversize 原子策略尚未实现。
+5. **容量验证**：尚未做 1k/10k/50k/100k scope 的 p50/p95、100k DB bytes 外推、Full 吞吐、外部供应商配额与固定提交/依赖锁验收。不能宣称支持 600M 源 tokens 或符合正式吞吐目标。
+6. **发行验收**：尚未完成真实模型 pair fixture、正式 Smoke、并发/崩溃/回滚完整故障注入与公开方法卡。
+
+继续对齐 Champion v1 规格前，需要先补齐并验证这些项目；本仓当前作为本地开发原型运行。
