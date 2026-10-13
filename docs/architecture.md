@@ -62,7 +62,8 @@ entry snapshot (Ecap)
 - 数据 TTL 固定 30 天，不因活动续期。退休先将 registry 置为 `retired`，等待活动 SQLite connection leases 关闭，再删除 DB/WAL/SHM；registry tombstone 留存，阻止同一 user ID 复活。
 - 外部请求不在 SQL 写事务期间执行。Search response cache、query-vector cache 与 full-bundle cache 均有界，cache key 含 scope hash；退休时清理对应 cache。
 - 当前运行形态是单服务副本、Uvicorn `workers=1`，HTTP 端口固定 `8001`。scope connection leases 与 cache retirement 以单进程为协调边界；多副本共享 SQLite 数据目录尚未实现，不应直接横向扩容。
-- `MEMORYSUM_DEBUG` 默认关闭；本机设为 true 时记录完整 Add/Search JSON 到 stdout，包含消息正文、问题、options 和 payload IDs。请求 headers 与 API credentials 永不写日志。调试日志可能包含敏感正文，不应共享或长期保留。
+- Search 的 `content` 只包含原文 evidence spans；source ID、角色和时间戳保留在内部 reranker 输入中，不以重复标签污染 API 正文。每条结果返回原始 reranker `score`（降序为更相关，不同模型间不保证可比）和 UTC `created_at`（来源时间优先，缺省时回退到 Add 接收时间）。窄查询按 rerank 分数排序后由 `top_k` 限制条数；大小写/空白规范化后完全相同的正文去重，仍受服务端最大记录数与输出预算约束。小 scope 的完整 bundle 仅在宽泛/上下文查询、候选数及 rerank 预算允许时逐条评分。
+- 每个 HTTP 请求默认记录一行不含正文的摘要，包含 UTC 时间戳、方法、路径、状态码与耗时；`MEMORYSUM_DEBUG` 默认关闭，设为 true 时额外记录完整 Add/Search JSON，包含消息正文、问题、options 和 payload IDs。请求 headers 与 API credentials 永不写日志。调试日志可能包含敏感正文，不应共享或长期保留。
 
 ## 版本边界
 
@@ -76,14 +77,14 @@ entry snapshot (Ecap)
 - context 窗口只跨同一 Add 请求内的消息源序，最多 4 spans；rerank 前可在组预算内扩回完整 atom，超预算则保留原窗口。
 - OpenRouter dense embedding adapter、embedding batch 上限、向量校验/归一、input hash 去重、lease/fence、sqlite-vec 精确 KNN。
 - FTS5 英文 + Jieba/中文 bigram，options lexical 提名，固定 RRF，bounded rerank 批次。
-- 小 scope 完整 bundle gate、reader-token 估算预算、source-span 稳定 ID、epoch、物理 30 天 TTL。
+- 仅 wide/context 查询可命中小 scope 完整 bundle gate；bundle 按独立原文消息返回，仍受 `top_k` 与 reader-token 预算约束。
 - SQLite vec0 / FTS5 本地启动 probe；fake provider 下的 API、幂等、隔离、检索、缓存与退休测试。
 
 ## 下一阶段开发项
 
 1. **模型合同**：当前 embedding provider 仅提供 dense vector，维度自动发现；没有原生 sparse postings。reranker 是临时 VL 模型，无法核对冻结版要求的 Qwen3 tokenizer、官方 yes/no pair template SHA 与 24k/48k 的精确真实 token 数。现在使用 `cl100k_base` 代理数，故配置明确为 `provisional`。
 2. **结构关系**：heading/table/list/exception/explicit-reference links 尚未建；atom kind 已保存但还没有 relation-aware 召回，embedded-dialogue attribution 识别也未实现。
-3. **时间与修订**：时间戳已保存与展示，但还没有 temporal candidate buckets 或 strict asserted-revision edges；自动 truth supersede/forget 仍保持关闭。
+3. **时间与修订**：时间戳已保存，并作为内部检索/排序元数据；API 正文不再拼接重复时间标签。尚未实现 temporal candidate buckets 或 strict asserted-revision edges；自动 truth supersede/forget 仍保持关闭。
 4. **个性化归因**：`is_personal_query` 检测函数已存在但未接入 Search；direct-user-form 候选保底和 embedded-dialogue 防误归因尚未实现。
 5. **写入任务优化**：SQLite 已按 input hash 保存 embedding 状态，但还没有跨进程输入级 single-flight worker pool，也没有 query 同 key 并发 single-flight。
 6. **输出组与容量**：跨消息 groups 已限制到 4 spans 并扩展 parent atoms；完整 structure paths、oversize atom 的显式 omission telemetry 尚未完成。还没有 1k/10k/50k/100k scope p50/p95、100k DB bytes 外推、Full 吞吐或供应商配额压测。

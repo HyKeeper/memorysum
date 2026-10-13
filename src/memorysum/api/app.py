@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from memorysum import __version__
 from memorysum.api.limits import RequestGate
-from memorysum.api.middleware import RequestSizeLimitMiddleware
+from memorysum.api.middleware import RequestLoggingMiddleware, RequestSizeLimitMiddleware
 from memorysum.api.schemas import AddRequest, AddResponse, SearchRequest, SearchResponse
 from memorysum.core.errors import ScopeRetired, ServiceError
 from memorysum.core.identity import scope_id
@@ -142,6 +142,8 @@ def create_app(
         RequestSizeLimitMiddleware,
         max_bytes=pipeline.capacity.max_body_bytes,
     )
+    # Wrap the size limiter so rejected and normal requests both get one access record.
+    app.add_middleware(RequestLoggingMiddleware)
 
     @app.exception_handler(ServiceError)
     async def service_error_handler(_request: Request, exc: ServiceError) -> JSONResponse:

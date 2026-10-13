@@ -110,6 +110,8 @@ def test_normal_mode_does_not_log_payload_or_audit_summaries(tmp_path, caplog):
     assert added.status_code == 200
     assert marker not in caplog.text
     assert "event=api_add" not in caplog.text
+    assert "event=http_request timestamp=" in caplog.text
+    assert "method=POST path=/add status=200 latency_ms=" in caplog.text
 
 
 def test_debug_payload_logging_is_not_gated_by_pipeline_status(tmp_path):

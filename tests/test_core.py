@@ -10,10 +10,29 @@ from pydantic import SecretStr
 
 from memorysum.core.errors import ProviderError
 from memorysum.core.ranking import reciprocal_rank_fusion
+from memorysum.core.rendering import render_response_spans
 from memorysum.core.vector import normalize_batch
 from memorysum.providers.openrouter import OpenRouterProvider
 from memorysum.providers.protocols import RerankScore
 from memorysum.settings import RuntimeSettings, load_pipeline_config
+
+
+def test_response_renderer_preserves_tag_like_source_text_verbatim():
+    source_text = "[Source: actually in source]\nRole: user\nTime: literal text"
+    content, _view_id, spans = render_response_spans(
+        [
+            {
+                "source_id": "source-1",
+                "public_source_id": "source-1",
+                "start_char": 0,
+                "end_char": len(source_text),
+                "raw_content": source_text,
+            }
+        ]
+    )
+
+    assert content == source_text
+    assert spans == [{"source_id": "source-1", "start_char": 0, "end_char": len(source_text)}]
 
 
 def test_rrf_merges_channels_and_uses_stable_ties():

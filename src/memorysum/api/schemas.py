@@ -137,6 +137,8 @@ class AddResponse(BaseModel):
 class SearchItem(BaseModel):
     id: str
     content: str
+    score: float
+    created_at: str
 
 
 class SearchResponse(BaseModel):

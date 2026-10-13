@@ -61,7 +61,7 @@ uv run memorysum
 }
 ```
 
-响应只包含 `data[].id` 与 `data[].content`；`top_k=0` 返回空数组，未知用户空间也返回 `{"data": []}`。不同 `user_id` 的数据不会互相检索。文本接口只接受字符串 `query` / `content`；有序图片 `ContentPart[]` 属于多模态赛道，本版本不实现。
+Search 每条结果包含 `id`、`content`、`score` 和 `created_at`：`score` 是当前 reranker 的原始数值分数，越大越相关（不同模型/版本间不保证可直接比较）；`created_at` 为 UTC ISO 8601，优先使用 Add 消息的来源 `timestamp`，未提供时回退到 Add 请求接收时间。`content` 是原文证据片段，不插入内部 `[Source]`、`Role`、`Time` 标签。窄查询走混合检索和 rerank，按分数排序后由 `top_k` 限制结果数；完全重复的正文会合并，结果仍受服务端记录数与输出预算上限约束。明确的宽泛/上下文查询在完整 bundle 预算与 rerank 容量允许时也会逐条评分；`top_k=0` 返回空数组，未知用户空间返回 `{"data": []}`。不同 `user_id` 的数据不会互相检索。文本接口只接受字符串 `query` / `content`；有序图片 `ContentPart[]` 属于多模态赛道，本版本不实现。
 
 ### Smoke 命令
 
@@ -81,7 +81,7 @@ curl -sS http://127.0.0.1:8001/search \
   -d '{"query":"What do I prefer?","user_id":"demo-user","top_k":10}'
 ```
 
-默认 `MEMORYSUM_DEBUG=false`，不会记录完整请求。开发时设置 `MEMORYSUM_DEBUG=true`，会将 Add/Search 的完整 JSON（正文、问题、options、user_id、request_id、session_id）输出到 stdout，便于本机调试。日志不会包含 HTTP headers、Authorization、OPENROUTER_API_KEY 或其他密钥。调试日志可能包含敏感正文，请仅在本机使用，避免共享或长期保留。
+默认 `MEMORYSUM_DEBUG=false` 时，每个 HTTP 请求仍会记录一行摘要，包含 UTC 时间戳、方法、路径、状态码和 `latency_ms`，但不记录请求正文。开发时设置 `MEMORYSUM_DEBUG=true`，会额外将 Add/Search 的完整 JSON（正文、问题、options、user_id、request_id、session_id）写入服务日志，便于本机调试。日志不会包含 HTTP headers、Authorization、OPENROUTER_API_KEY 或其他密钥。调试日志可能包含敏感正文，请仅在本机使用，避免共享或长期保留。
 
 如需查看真实请求 JSON，可在本机开发时开启 `MEMORYSUM_DEBUG=true`；不要在共享机器或日志长期留存环境开启。
 
@@ -92,7 +92,7 @@ curl -sS http://127.0.0.1:8001/search \
 3. OpenRouter embedding 批量请求；校验 vector 个数、维度、finite/norm，并按 float32 归一化存入 `sqlite-vec`。
 4. SQLite FTS5 英文词法 + Jieba/中文 bigram 词法与双尺度 dense 召回，按 RRF 排名；options 作为受限词法提名。
 5. 对同消息相交窗口合并；跨消息 context groups 保留清晰 span 边界并受窗口数限制，再经 OpenRouter rerank；任何批次失败都不返回部分排序。
-6. 小空间满足完整渲染 gate 时返回完整原文 bundle，不做“前缀全文”；普通检索按完整证据组与 prompt 预算选择输出。
+6. 宽泛/上下文检索在预算内可按消息返回完整原文；普通检索按 rerank 排序、`top_k`、证据组与 prompt 预算选择原文片段，不把元数据标签拼进 API 正文。
 7. 新 Add 通过入口 epoch 与原子发布隔离；用户数据从首次接收起 30 天固定 TTL，过期后退休并清理 SQLite/WAL/SHM。
 
 结构与边界详见 [`docs/architecture.md`](docs/architecture.md)。
@@ -122,7 +122,7 @@ export MEMORYSUM_HOST=0.0.0.0
 uv run memorysum
 ```
 
-API 端口固定为 **8001**；健康检查 `/health` 无鉴权，Add/Search 必须使用 `Authorization: Bearer ...`。云服务器需在安全组开放 TCP 8001；生产访问建议放在 HTTPS 反向代理后。`MEMORYSUM_DEBUG=true` 会将请求正文写入 stdout，仅用于受控开发调试。
+API 端口固定为 **8001**；健康检查 `/health` 无鉴权，Add/Search 必须使用 `Authorization: Bearer ...`。云服务器需在安全组开放 TCP 8001；生产访问建议放在 HTTPS 反向代理后。`MEMORYSUM_DEBUG=true` 会将请求正文写入服务日志，仅用于受控开发调试。
 
 ## 规则与设计资料
 

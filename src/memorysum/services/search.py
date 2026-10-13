@@ -29,6 +29,8 @@ from memorysum.core.rendering import (
     FULL_BUNDLE_SEPARATOR,
     full_bundle_token_cost,
     render_full_bundle,
+    render_message,
+    render_response_window,
     render_window,
 )
 from memorysum.core.text import (
@@ -37,6 +39,7 @@ from memorysum.core.text import (
     query_options_text,
     reader_token_count,
     safe_fts_expression,
+    utc_timestamp,
 )
 from memorysum.core.vector import normalize_batch, vector_to_blob
 from memorysum.providers.protocols import ModelProvider
@@ -48,6 +51,13 @@ _RENDER_TOKEN_OVERHEAD = 8
 _OPTION_LABEL_RE = re.compile(r"^\s*(?:[A-Za-z][.)]|[A-Za-z][:：]|\d+[.)])\s*")
 
 
+def _resolved_created_at_ms(source_timestamp_ms: object, received_ms: object) -> int:
+    timestamp_ms = source_timestamp_ms if source_timestamp_ms is not None else received_ms
+    if timestamp_ms is None:
+        raise StorageError()
+    return int(timestamp_ms)
+
+
 @dataclass(frozen=True)
 class Snapshot:
     epoch: int
@@ -57,11 +67,19 @@ class Snapshot:
 
 
 @dataclass(frozen=True)
+class FullBundle:
+    messages: tuple[dict[str, object], ...]
+    token_cost: int
+
+
+@dataclass(frozen=True)
 class RerankEntry:
     candidate: FusedCandidate
     view_id: str
-    content: str
+    rerank_content: str
+    response_content: str
     spans: list[dict[str, object]]
+    created_at_ms: int
     pair_proxy_tokens: int
 
 
@@ -84,7 +102,7 @@ class SearchService:
         self._pipeline = pipeline
         self._query_vectors: TTLCache[list[float]] = TTLCache(1024, 300)
         self._results: TTLCache[SearchResponse] = TTLCache(256, 60)
-        self._full_bundles: TTLCache[tuple[str, str, int]] = TTLCache(64, 300)
+        self._full_bundles: TTLCache[FullBundle] = TTLCache(64, 300)
 
     def clear_scope(self, scope_key: str) -> None:
         self._query_vectors.clear_scope(scope_key)
@@ -151,14 +169,36 @@ class SearchService:
             wide_mode or context_mode,
         )
         if full_bundle is not None:
-            diagnostics["strategy"] = "full_bundle"
-            diagnostics["full_bundle_tokens_est"] = full_bundle[2]
-            diagnostics["returned_records"] = 1
-            content, view_id, _ = full_bundle
-            response = SearchResponse(data=[SearchItem(id=view_id, content=content)])
-            self._database.assert_scope_active(request.user_id)
-            self._results.set(result_cache_key, response)
-            return response
+            mode = self._pipeline.retrieval.wide if wide_mode else self._pipeline.retrieval.ordinary
+            entries = self._prepare_full_bundle_entries(
+                full_bundle.messages,
+                request,
+                options,
+                wide_mode,
+            )
+            if entries is not None:
+                diagnostics["strategy"] = "full_bundle"
+                diagnostics["full_bundle_tokens_est"] = full_bundle.token_cost
+                diagnostics["rerank_groups"] = len(entries)
+                diagnostics["rerank_pair_tokens_est"] = sum(
+                    entry.pair_proxy_tokens for entry in entries
+                )
+                rerank_query = self._rerank_query(request.query, options)
+                scores = self._rerank_entries(rerank_query, entries, deadline)
+                ranked = sorted(
+                    zip(entries, scores, strict=True),
+                    key=lambda pair: (
+                        -pair[1],
+                        -pair[0].candidate.score,
+                        pair[0].view_id,
+                    ),
+                )
+                response = self._select_output(ranked, request.top_k, mode, question_cost)
+                diagnostics["returned_records"] = len(response.data)
+                diagnostics["returned_chars"] = sum(len(item.content) for item in response.data)
+                self._database.assert_scope_active(request.user_id)
+                self._results.set(result_cache_key, response)
+                return response
 
         if snapshot.dimension is None:
             raise StorageError()
@@ -251,7 +291,13 @@ class SearchService:
         snapshot: Snapshot,
         question_cost: int,
         wide_or_context: bool,
-    ) -> tuple[str, str, int] | None:
+    ) -> FullBundle | None:
+        if (
+            self._pipeline.coverage.conditional_full_requires_wide_or_context_mode
+            and not wide_or_context
+        ):
+            return None
+
         estimate = snapshot.full_render_tokens_est + reader_token_count(
             FULL_BUNDLE_SEPARATOR
         ) * max(0, snapshot.active_message_count - 1)
@@ -264,11 +310,12 @@ class SearchService:
             messages = self._load_messages(reference, user_id, snapshot.epoch)
             if not messages:
                 return None
-            content, view_id = render_full_bundle(messages)
-            full_cost = full_bundle_token_cost(messages)
-            cached = (content, view_id, full_cost)
+            cached = FullBundle(
+                messages=tuple(dict(message) for message in messages),
+                token_cost=full_bundle_token_cost(messages),
+            )
             self._full_bundles.set(cache_key, cached)
-        content, view_id, full_cost = cached
+        full_cost = cached.token_cost
 
         full_threshold = self._pipeline.coverage.always_full_tokens
         if full_cost > full_threshold:
@@ -282,7 +329,79 @@ class SearchService:
         ) * self._pipeline.coverage.estimation_safety_factor
         if safe_total > self._pipeline.coverage.safe_input_tokens:
             return None
-        return content, view_id, full_cost
+        return cached
+
+    def _prepare_full_bundle_entries(
+        self,
+        messages: Sequence[Mapping[str, object]],
+        request: SearchRequest,
+        options: Sequence[str],
+        wide_mode: bool,
+    ) -> list[RerankEntry] | None:
+        max_groups = (
+            self._pipeline.reranker.wide_candidate_groups
+            if wide_mode
+            else self._pipeline.reranker.ordinary_candidate_groups
+        )
+        pair_budget = (
+            self._pipeline.reranker.wide_pair_proxy_budget
+            if wide_mode
+            else self._pipeline.reranker.ordinary_pair_proxy_budget
+        )
+        if not messages or len(messages) > max_groups:
+            return None
+
+        rerank_question = query_options_text(request.query, list(options) if options else None)
+        rendered_messages = render_full_bundle(messages)
+        entries: list[RerankEntry] = []
+        spent = 0
+        for index, ((view_id, response_content), message) in enumerate(
+            zip(rendered_messages, messages, strict=True)
+        ):
+            public_source_id = str(message["public_source_id"])
+            source_timestamp_ms = message["source_timestamp_ms"]
+            created_at_ms = _resolved_created_at_ms(
+                source_timestamp_ms,
+                message.get("request_received_ms"),
+            )
+            rerank_content = render_message(
+                "msg_" + public_source_id[:16],
+                str(message["role"]),
+                source_timestamp_ms,  # type: ignore[arg-type]
+                response_content,
+            )
+            pair_text = (
+                f"<Instruct>: {self._pipeline.reranker.instruction}\n"
+                f"<Query>: {rerank_question}\n<Document>: {rerank_content}"
+            )
+            pair_cost = reader_token_count(pair_text)
+            if (
+                pair_cost > self._pipeline.reranker.single_pair_proxy_tokens
+                or spent + pair_cost > pair_budget
+            ):
+                return None
+            span = {
+                "source_id": public_source_id,
+                "start_char": 0,
+                "end_char": len(response_content),
+            }
+            entries.append(
+                RerankEntry(
+                    candidate=FusedCandidate(
+                        window_id=index,
+                        best_rank=index + 1,
+                        channels={"full_bundle"},
+                    ),
+                    view_id=view_id,
+                    rerank_content=rerank_content,
+                    response_content=response_content,
+                    spans=[span],
+                    created_at_ms=created_at_ms,
+                    pair_proxy_tokens=pair_cost,
+                )
+            )
+            spent += pair_cost
+        return entries
 
     def _load_messages(self, reference: ScopeRef, user_id: str, epoch: int) -> list[sqlite3.Row]:
         connection = self._database.connect(reference, user_id)
@@ -290,7 +409,8 @@ class SearchService:
             with transaction(connection, "DEFERRED"):
                 rows = connection.execute(
                     """SELECT m.message_id, m.public_source_id, m.request_id, m.ordinal,
-                              m.role, m.source_timestamp_ms, m.raw_content, m.reader_token_est
+                              m.role, m.source_timestamp_ms, m.raw_content, m.reader_token_est,
+                              r.received_ms AS request_received_ms
                        FROM messages AS m
                        JOIN requests AS r ON r.request_id=m.request_id
                        WHERE r.state='ready' AND r.published_epoch<=?
@@ -481,9 +601,10 @@ class SearchService:
             f"""SELECT s.window_id, s.ordinal AS span_ordinal, s.message_id,
                        s.start_char, s.end_char, m.public_source_id, m.request_id,
                        m.ordinal AS message_ordinal, m.role, m.source_timestamp_ms,
-                       m.raw_content
+                       m.raw_content, r.received_ms AS request_received_ms
                 FROM window_spans AS s
                 JOIN messages AS m ON m.message_id=s.message_id
+                JOIN requests AS r ON r.request_id=m.request_id
                 WHERE s.window_id IN ({placeholders})
                 ORDER BY s.window_id, s.ordinal""",
             window_ids,
@@ -502,6 +623,7 @@ class SearchService:
                 "message_ordinal": int(source["message_ordinal"]),
                 "role": str(source["role"]),
                 "source_timestamp_ms": source["source_timestamp_ms"],
+                "request_received_ms": int(source["request_received_ms"]),
                 "raw_content": str(source["raw_content"]),
                 "atoms": [],
             }
@@ -723,10 +845,17 @@ class SearchService:
         groups = self._group_overlapping_candidates(fused, rows)
         for group in groups:
             candidate = group.candidate
-            content, view_id, spans = render_window(group.row)
+            rerank_content, view_id, spans = render_window(group.row)
+            response_content, _, _ = render_response_window(group.row)
+            source_spans = group.row["source_spans"]
+            primary_span = source_spans[0]  # type: ignore[index]
+            created_at_ms = _resolved_created_at_ms(
+                primary_span.get("source_timestamp_ms"),
+                primary_span.get("request_received_ms"),
+            )
             pair_text = (
                 f"<Instruct>: {self._pipeline.reranker.instruction}\n"
-                f"<Query>: {rerank_question}\n<Document>: {content}"
+                f"<Query>: {rerank_question}\n<Document>: {rerank_content}"
             )
             pair_cost = reader_token_count(pair_text)
             existing = candidates_by_view.get(view_id)
@@ -734,8 +863,10 @@ class SearchService:
                 candidates_by_view[view_id] = RerankEntry(
                     candidate=candidate,
                     view_id=view_id,
-                    content=content,
+                    rerank_content=rerank_content,
+                    response_content=response_content,
                     spans=spans,
+                    created_at_ms=created_at_ms,
                     pair_proxy_tokens=pair_cost,
                 )
 
@@ -778,7 +909,7 @@ class SearchService:
             executor.submit(
                 self._provider.rerank,
                 query,
-                [entries[index].content for index in batch],
+                [entries[index].rerank_content for index in batch],
             ): batch
             for batch in batches
         }
@@ -844,9 +975,13 @@ class SearchService:
         selected: list[SearchItem] = []
         spent = 0
         covered: dict[str, list[tuple[int, int]]] = {}
-        for entry, _score in ranked:
+        seen_content: set[str] = set()
+        for entry, score in ranked:
             if len(selected) >= max_records:
                 break
+            content_key = " ".join(entry.response_content.split()).casefold()
+            if content_key in seen_content:
+                continue
             spans = entry.spans
             already_covered = all(
                 any(
@@ -857,11 +992,19 @@ class SearchService:
             )
             if already_covered:
                 continue
-            cost = reader_token_count(entry.content) + _RENDER_TOKEN_OVERHEAD
+            cost = reader_token_count(entry.response_content) + _RENDER_TOKEN_OVERHEAD
             if spent + cost > memory_budget:
                 continue
-            selected.append(SearchItem(id=entry.view_id, content=entry.content))
+            selected.append(
+                SearchItem(
+                    id=entry.view_id,
+                    content=entry.response_content,
+                    score=score,
+                    created_at=utc_timestamp(entry.created_at_ms),
+                )
+            )
             spent += cost
+            seen_content.add(content_key)
             for span in spans:
                 covered.setdefault(str(span["source_id"]), []).append(
                     (int(span["start_char"]), int(span["end_char"]))

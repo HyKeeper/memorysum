@@ -30,17 +30,33 @@ class FakeProvider:
 
     def rerank(self, query, documents):
         self.rerank_batches.append((query, list(documents)))
-        normalized_query = query.lower()
         return [
             RerankScore(
                 index=index,
-                score=1.0 if "tea" in normalized_query and "tea" in document.lower() else 0.1,
+                score=(
+                    1.0
+                    if "tea" in document.lower()
+                    and any(term in query.lower() for term in ("tea", "prefer"))
+                    else 0.0005
+                ),
             )
             for index, document in enumerate(documents)
         ]
 
     def close(self) -> None:
         pass
+
+
+class FruitProvider(FakeProvider):
+    def rerank(self, query, documents):
+        self.rerank_batches.append((query, list(documents)))
+        return [
+            RerankScore(
+                index=index,
+                score=0.0022 if "i love apple" in document.lower() else 0.0005,
+            )
+            for index, document in enumerate(documents)
+        ]
 
 
 def make_app(data_root: Path, provider: FakeProvider):
@@ -110,7 +126,9 @@ def test_add_is_synchronous_idempotent_and_user_isolated(tmp_path):
         assert search.status_code == 200
         assert len(search.json()["data"]) == 1
         assert "I prefer tea" in search.json()["data"][0]["content"]
-        assert set(search.json()["data"][0]) == {"id", "content"}
+        assert set(search.json()["data"][0]) == {"id", "content", "score", "created_at"}
+        assert search.json()["data"][0]["score"] == 1.0
+        assert search.json()["data"][0]["created_at"] == "2024-01-01T00:00:00.000Z"
 
         isolated = client.post(
             "/search", json={"query": "What do I prefer?", "user_id": "user/two", "top_k": 10}
@@ -124,6 +142,112 @@ def test_add_is_synchronous_idempotent_and_user_isolated(tmp_path):
         )
         assert conflict.status_code == 422
         assert conflict.json()["detail"]["code"] == "request_id_payload_conflict"
+
+
+def test_small_scope_narrow_search_returns_ranked_clean_items_and_obeys_top_k(tmp_path):
+    provider = FruitProvider()
+    app = make_app(tmp_path / "data", provider)
+    source_messages = [
+        "raw memory text",
+        "I love apple",
+        "I love sing",
+        "i love apple【Doing】",
+        "i love apple【Doing】",
+    ]
+
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        for index, content in enumerate(source_messages):
+            message = {"role": "user", "content": content}
+            if index > 0:
+                message["timestamp"] = 1704067200000 + index
+            added = client.post(
+                "/add",
+                json={
+                    "request_id": f"fruit-add-{index}",
+                    "user_id": "fruit-user",
+                    "session_id": f"fruit-session-{index}",
+                    "messages": [message],
+                },
+            )
+            assert added.status_code == 200
+
+        narrow = client.post(
+            "/search",
+            json={
+                "query": "Which fruit i love?",
+                "options": ["A. First answer", "B. Second answer"],
+                "user_id": "fruit-user",
+                "top_k": 100,
+            },
+        )
+        narrow_top_one = client.post(
+            "/search",
+            json={
+                "query": "Which fruit i love?",
+                "options": ["A. First answer", "B. Second answer"],
+                "user_id": "fruit-user",
+                "top_k": 1,
+            },
+        )
+        broad = client.post(
+            "/search",
+            json={"query": "List all memories", "user_id": "fruit-user", "top_k": 100},
+        )
+        broad_limited = client.post(
+            "/search",
+            json={"query": "List all memories", "user_id": "fruit-user", "top_k": 2},
+        )
+
+    assert (
+        narrow.status_code
+        == narrow_top_one.status_code
+        == broad.status_code
+        == broad_limited.status_code
+        == 200
+    )
+    narrow_items = narrow.json()["data"]
+    narrow_contents = [item["content"] for item in narrow_items]
+    assert "apple" in narrow_contents[0].lower()
+    assert {"raw memory text", "I love sing", "i love apple【Doing】"}.issubset(
+        set(narrow_contents)
+    )
+    assert len(narrow_contents) == len(
+        {" ".join(content.split()).casefold() for content in narrow_contents}
+    )
+    assert len(narrow_top_one.json()["data"]) == 1
+    assert "apple" in narrow_top_one.json()["data"][0]["content"].lower()
+    assert all(
+        set(item) == {"id", "content", "score", "created_at"} for item in narrow_items
+    )
+    assert all(isinstance(item["score"], (int, float)) for item in narrow_items)
+    assert all(isinstance(item["created_at"], str) for item in narrow_items)
+    raw_item = next(item for item in narrow_items if item["content"] == "raw memory text")
+    assert raw_item["created_at"].endswith("Z")
+    assert narrow_items[0]["score"] >= max(item["score"] for item in narrow_items[1:])
+    assert all(
+        label not in item["content"]
+        for item in narrow_items
+        for label in ("[Source:", "Role:", "Time:")
+    )
+    assert provider.rerank_batches
+    rerank_queries = [query for query, _documents in provider.rerank_batches]
+    rerank_documents = [
+        document for _query, documents in provider.rerank_batches for document in documents
+    ]
+    assert any("A. First answer" in query for query in rerank_queries)
+    assert any("[Source: msg_" in document and "Time:" in document for document in rerank_documents)
+
+    broad_items = broad.json()["data"]
+    assert set(item["content"] for item in broad_items) == set(source_messages[:-1])
+    assert all(set(item) == {"id", "content", "score", "created_at"} for item in broad_items)
+    assert all(
+        label not in item["content"]
+        for item in broad_items
+        for label in ("[Source:", "Role:", "Time:")
+    )
+    limited_items = broad_limited.json()["data"]
+    assert len(limited_items) == 2
+    assert all(set(item) == {"id", "content", "score", "created_at"} for item in limited_items)
 
 
 def test_long_scope_uses_retrieval_and_reranker(tmp_path):

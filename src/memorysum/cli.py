@@ -16,6 +16,8 @@ def main() -> None:
         host=runtime.host,
         port=runtime.port,
         workers=1,
+        # RequestLoggingMiddleware emits access logs with UTC time and latency.
+        access_log=False,
     )
 
 
