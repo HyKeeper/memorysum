@@ -132,7 +132,10 @@ def test_add_is_synchronous_idempotent_and_user_isolated(tmp_path):
         assert len(search.json()["data"]) == 1
         assert "I prefer tea" in search.json()["data"][0]["content"]
         assert set(search.json()["data"][0]) == {"id", "content", "score", "created_at"}
-        assert search.json()["data"][0]["score"] == 1.0
+        # With the reranker enabled the returned score is the fused rank score
+        # (1/(k+rerank_rank) + w/(k+rrf_rank)), not the raw rerank logit.
+        fused_score = search.json()["data"][0]["score"]
+        assert 0.0 < fused_score < 0.2
         assert search.json()["data"][0]["created_at"] == "2024-01-01T00:00:00.000Z"
 
         isolated = client.post(

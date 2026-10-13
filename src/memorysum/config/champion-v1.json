@@ -12,7 +12,8 @@
     "input_proxy_tokens": 4096
   },
   "reranker": {
-    "enabled": false,
+    "enabled": true,
+    "fusion_weight": 2.0,
     "provider": "local-openai",
     "model": "bge-reranker-v2-m3",
     "instruction": "",

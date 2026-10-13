@@ -885,21 +885,57 @@ class SearchService:
         options: Sequence[str],
         deadline: float,
     ) -> list[tuple[RerankEntry, float]]:
-        """Order entries: by rerank score when enabled, else keep fusion order.
+        """Order entries: ranked by the reranker when enabled, else by fusion.
 
         With `reranker.enabled = false` the pipeline stops after reciprocal-rank
-        fusion and the returned score is the fusion score itself; no rerank
-        request is issued, so no provider quota is spent.
+        fusion and the returned score IS the fusion score. When enabled, the
+        reranker's ranking is fused back with the fusion ranking (see
+        `_fuse_rankings`) instead of replacing it outright, because measuring
+        showed pure rerank ordering is unstable across query halves.
         """
         if not self._pipeline.reranker.enabled:
             return [(entry, entry.candidate.score) for entry in entries]
         rerank_query = self._rerank_query(query, options)
         scores = self._rerank_entries(rerank_query, entries, deadline)
+        return self._fuse_rankings(entries, scores)
+
+    def _fuse_rankings(
+        self,
+        entries: Sequence[RerankEntry],
+        scores: Sequence[float],
+    ) -> list[tuple[RerankEntry, float]]:
+        """Fuse rerank ranks with retrieval ranks; score = rerank + w * retrieval.
+
+        Reciprocal-rank fusion keeps the multi-channel agreement signal that the
+        cross-encoder alone discards, so the reranker reorders near-ties instead
+        of being trusted absolutely. `reranker.fusion_weight` sets w.
+        """
+        k = self._pipeline.retrieval.rrf_k
+        weight = self._pipeline.reranker.fusion_weight
+        by_retrieval = sorted(
+            range(len(entries)),
+            key=lambda index: (
+                -round(entries[index].candidate.score, 12),
+                entries[index].candidate.best_rank,
+                entries[index].candidate.window_id,
+            ),
+        )
+        retrieval_rank = {index: rank + 1 for rank, index in enumerate(by_retrieval)}
+        by_rerank = sorted(range(len(entries)), key=lambda index: (-scores[index], index))
+        rerank_rank = {index: rank + 1 for rank, index in enumerate(by_rerank)}
+
+        fused = [
+            (
+                entries[index],
+                1.0 / (k + rerank_rank[index]) + weight / (k + retrieval_rank[index]),
+            )
+            for index in range(len(entries))
+        ]
         return sorted(
-            zip(entries, scores, strict=True),
+            fused,
             key=lambda pair: (
-                -pair[1],
-                -pair[0].candidate.score,
+                -round(pair[1], 12),
+                pair[0].candidate.best_rank,
                 pair[0].view_id,
             ),
         )

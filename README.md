@@ -13,6 +13,10 @@
 
 > **本地 rerank 支持与实测结论（2026-10-13）**：`providers/local_openai.py` 现在同时提供本地 cross-encoder 精排（`LocalRerankProvider`），兼容两种响应形状——llama.cpp `--reranking` 的 `{"results":[{"index","relevance_score"}]}` 与自建 FastAPI 服务的裸数组 `[{"index","score"}]`；端点由 `MEMORYSUM_RERANK_BASE_URL` 指定（默认 `http://127.0.0.1:7997`），`reranker.instruction` 为空表示不给 cross-encoder 加任何指令前缀。**但当前 `reranker.enabled=false`**：在 BEAM 单 scope + 60 条英文事实查询上实测，本地 `bge-reranker-v2-m3`（568M，F16 GGUF，由 `convert_hf_to_gguf.py` 从 safetensors 转换）把 top-1 34→35/60、top-3 44→47、MRR 0.664→0.682，**修复 10 条同时弄坏 9 条（净 +1）**，而 p50 延迟从 71ms 涨到 1961ms（**28 倍**）；判断是“重排”而非“改进”——它常把同一主题的另一段代码排到前面，对单-gold 评测是损失，对真实使用未必有错，但净收益不足以抵消延迟。启动本地 rerank 服务：`llama-server -m bge-reranker-v2-m3-f16.gguf --reranking --pooling rank -fa on -c 8192 -ngl 99 --port 7997`（约 887MiB 显存）。另实测：rerank 输入带/不带 `Source role:/Passage:` 渲染前缀时 top-5 完全一致（5/5），故未改渲染。
 
+> **本地 rerank + 排序融合（2026-10-13 实测）**：`reranker.enabled=true`，精排走本机 llama.cpp 的 `bge-reranker-v2-m3`（`MEMORYSUM_RERANK_BASE_URL`，默认 `:7997`；模型由 `convert_hf_to_gguf.py` 从 safetensors 转换）。**关键设计：精排结果不再直接取代检索排序，而是与 RRF 排名再做一次融合**——`score = 1/(k + rerank_rank) + w/(k + retrieval_rank)`，`reranker.fusion_weight` 默认 **2.0**，即“以多通道共识为主、精排为辅”。依据：BEAM 单 scope + 60 条英文事实查询上，**纯 rerank 排序**把 top-1 从 34 提到 35、MRR 0.664→0.677，但在两个半样本上极不稳定（前半 +4、后半 **-3**，fixed 10 / broken 9）；**融合排序**得到 top-1 38、top-3 48、MRR 0.733，且**两半都不劣化**（+4 / 0），只弄坏 1 条检索本来正确的查询。线上复测 top-1 37/60、top-3 48/60、MRR 0.721（含 embedding 非确定性波动）。代价是每次检索约 +2 秒延迟。精排输入带/不带 `Source role:/Passage:` 渲染前缀时 top-5 完全一致，故未改渲染。
+>
+> **embedding 量化（同日）**：embedding 服务换成 `Qwen3-Embedding-4B-Q8_0.gguf`（本地用 `llama-quantize` 从 F16 转出，7.5GB→4.0GB），embedding 显存 **11890→8008 MiB（省 3.8GB）**，向量 cos 0.998，延迟反而更快（单条 15ms vs 25ms）。实测跨源（F16 文档向量 + Q8 查询向量）在 60 查询上 top-1/top-3 完全不变，因此未重建数据。1024 维 MRL 截断虽几乎无损（dense 召回 57/60 不变、均值排名 6.8→6.9），但**只省存储不省显存**，故未采用。
+
 ## 实现原则
 
 - **Search 只返回历史证据**，不回答问题、不调用生成式模型，也不把答案伪装成记忆。

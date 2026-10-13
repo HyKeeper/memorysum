@@ -17,6 +17,7 @@ from memorysum.providers.local_openai import LocalEmbeddingProvider
 from memorysum.providers.openrouter import OpenRouterProvider
 from memorysum.providers.protocols import RerankScore
 from memorysum.providers.split import SplitProvider
+from memorysum.services.search import SearchService
 from memorysum.settings import RuntimeSettings, load_pipeline_config
 
 
@@ -301,3 +302,50 @@ def test_factory_rejects_unknown_provider_in_config():
     )
     with pytest.raises(ValueError, match="Unsupported model provider"):
         build_provider(_local_runtime(), broken)
+
+
+def test_rerank_fusion_blends_rerank_and_retrieval_rankings():
+    """融合排序：既不忽略精排，也不丢检索侧的多通道共识。"""
+    from memorysum.core.ranking import FusedCandidate
+    from memorysum.services.search import RerankEntry
+
+    def entry(window_id: int, rrf_score: float, best_rank: int) -> RerankEntry:
+        return RerankEntry(
+            candidate=FusedCandidate(
+                window_id=window_id, score=rrf_score, best_rank=best_rank, channels={"leaf_dense"}
+            ),
+            view_id=f"view-{window_id}",
+            rerank_content=f"doc {window_id}",
+            response_content=f"doc {window_id}",
+            spans=[],
+            created_at_ms=0,
+            pair_proxy_tokens=10,
+        )
+
+    # A: 检索侧最强（RRF rank 1），精排最弱（rank 3）
+    # C: 精排最强（rank 1），检索侧最弱（rank 3）
+    # B: 两边都居中
+    entries = [
+        entry(1, 0.030, 1),
+        entry(2, 0.020, 2),
+        entry(3, 0.010, 3),
+    ]
+    scores = [0.1, 0.5, 0.9]  # 精排把 C 排第一
+
+    service = SearchService.__new__(SearchService)  # 只测纯函数，不建完整栈
+
+    class _Pipeline:
+        class reranker:
+            fusion_weight = 2.0
+
+        class retrieval:
+            rrf_k = 60
+
+    service._pipeline = _Pipeline()
+    ordered = service._fuse_rankings(entries, scores)
+
+    assert len(ordered) == 3
+    # 融合分公式：1/(60+rerank_rank) + w/(60+retrieval_rank)，w=2.0
+    # A: 1/63 + 2/61 = 0.04866   B: 1/62 + 2/62 = 0.04839   C: 1/61 + 2/63 = 0.04814
+    assert [pair[0].candidate.window_id for pair in ordered] == [1, 2, 3]
+    assert service._pipeline.reranker.fusion_weight == 2.0

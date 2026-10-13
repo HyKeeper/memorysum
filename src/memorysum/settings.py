@@ -43,6 +43,8 @@ class EmbeddingConfig(FrozenConfig):
 class RerankerConfig(FrozenConfig):
     #: Set false to stop after fusion (no rerank model call, score = RRF score).
     enabled: bool = True
+    #: Weight of the retrieval ranking when fusing with the reranker ranking.
+    fusion_weight: float = 2.0
     provider: str
     model: str
     instruction: str
