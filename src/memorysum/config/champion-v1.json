@@ -13,16 +13,16 @@
   },
   "reranker": {
     "enabled": false,
-    "provider": "openrouter",
-    "model": "qwen/qwen3-reranker-8b",
-    "instruction": "Retrieve original memory evidence relevant to the question and all provided options, including necessary context, dates, conditions, and exceptions.",
+    "provider": "local-openai",
+    "model": "bge-reranker-v2-m3",
+    "instruction": "",
     "single_pair_proxy_tokens": 8192,
     "ordinary_pair_proxy_budget": 24000,
     "wide_pair_proxy_budget": 48000,
     "ordinary_candidate_groups": 64,
     "wide_candidate_groups": 100,
     "batch_groups": 16,
-    "max_concurrency": 2
+    "max_concurrency": 4
   },
   "chunking": {
     "leaf": {"min": 128, "target": 256, "max": 320, "overlap": 64},

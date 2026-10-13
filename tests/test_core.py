@@ -218,6 +218,15 @@ def test_provider_factory_splits_local_embeddings_from_remote_rerank():
         return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.7}]})
 
     pipeline = load_pipeline_config()
+    # Pin the remote reranker explicitly so this test does not depend on the
+    # packaged config's current choice.
+    pipeline = pipeline.model_copy(
+        update={
+            "reranker": pipeline.reranker.model_copy(
+                update={"provider": "openrouter", "enabled": True}
+            )
+        }
+    )
     provider = build_provider(
         _local_runtime(),
         pipeline,
@@ -232,6 +241,45 @@ def test_provider_factory_splits_local_embeddings_from_remote_rerank():
 
     assert calls[0] == "http://127.0.0.1:7999/v1/embeddings"
     assert calls[1] == "https://openrouter.ai/api/v1/rerank"
+
+
+def test_provider_factory_serves_local_rerank_endpoint_with_plain_list_response():
+    """Local embedding + local rerank must hit both local endpoints.
+
+    Also covers the bare-array response shape used by plain FastAPI rerank
+    services (``[{"index": i, "score": s}]``) rather than the OpenRouter shape.
+    """
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append({"url": str(request.url), "body": json.loads(request.content)})
+        if request.url.path.endswith("/embeddings"):
+            return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0, 2.0]}]})
+        return httpx.Response(200, json=[{"index": 0, "score": 0.9, "document": "first"}])
+
+    pipeline = load_pipeline_config()
+    pipeline = pipeline.model_copy(
+        update={
+            "reranker": pipeline.reranker.model_copy(
+                update={"provider": "local-openai", "enabled": True}
+            )
+        }
+    )
+    provider = build_provider(
+        _local_runtime(),
+        pipeline,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert provider.embed(["passage"]) == [[1.0, 2.0]]
+        assert provider.rerank("question", ["first"]) == [RerankScore(0, 0.9)]
+    finally:
+        provider.close()
+
+    assert calls[0]["url"] == "http://127.0.0.1:7999/v1/embeddings"
+    assert calls[1]["url"] == "http://127.0.0.1:7997/rerank"
+    assert calls[1]["body"]["query"] == "question"
+    assert calls[1]["body"]["documents"] == ["first"]
 
 
 def test_embedding_endpoint_follows_the_configured_provider():

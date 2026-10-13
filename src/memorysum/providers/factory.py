@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import httpx
 
-from memorysum.providers.local_openai import LocalEmbeddingProvider
+from memorysum.providers.local_openai import LocalEmbeddingProvider, LocalRerankProvider
 from memorysum.providers.openrouter import OpenRouterProvider
 from memorysum.providers.protocols import ModelProvider
 from memorysum.providers.split import SplitProvider
@@ -36,15 +36,17 @@ def build_provider(
     embedding_is_local = pipeline.embedding.provider in LOCAL_PROVIDER_NAMES
     rerank_is_local = pipeline.reranker.provider in LOCAL_PROVIDER_NAMES
 
-    if rerank_is_local:
-        if pipeline.reranker.enabled:
-            raise ValueError("A local reranker is not implemented; use a remote reranker provider")
-        return LocalEmbeddingProvider(runtime, pipeline, transport=transport)
-
-    if not embedding_is_local:
+    if not embedding_is_local and not rerank_is_local:
         return OpenRouterProvider(runtime, pipeline, transport=transport)
 
-    return SplitProvider(
-        LocalEmbeddingProvider(runtime, pipeline, transport=transport),
-        OpenRouterProvider(runtime, pipeline, transport=transport),
+    embedding_provider: ModelProvider = (
+        LocalEmbeddingProvider(runtime, pipeline, transport=transport)
+        if embedding_is_local
+        else OpenRouterProvider(runtime, pipeline, transport=transport)
     )
+    rerank_provider: ModelProvider = (
+        LocalRerankProvider(runtime, pipeline, transport=transport)
+        if rerank_is_local
+        else OpenRouterProvider(runtime, pipeline, transport=transport)
+    )
+    return SplitProvider(embedding_provider, rerank_provider)

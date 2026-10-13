@@ -11,6 +11,8 @@
 
 > **配置清理（2026-10-13）**：`champion-v1.json` 现在只保留被代码真正读取的字段。已删除的纯装饰性字段（`features` 整段、`language`、`generation_enabled`、`embedding.sparse_output`、`reranker.tokenizer`/`tokenizer_is_approximate`、`chunking.token_proxy`、`retrieval.unused_quota_transfer`/`sparse_channel`、`coverage.reader_estimator`）此前只表达能力声明，改它们不会影响任何行为。特别地，`capacity.max_add_messages`/`max_search_options` 曾是**假配置**——声明了但真实限制硬编码在 `api/schemas.py`，现已改为 schemas 直接读 config，并由 `test_wire_limits_track_pipeline_config` 守护。
 
+> **本地 rerank 支持与实测结论（2026-10-13）**：`providers/local_openai.py` 现在同时提供本地 cross-encoder 精排（`LocalRerankProvider`），兼容两种响应形状——llama.cpp `--reranking` 的 `{"results":[{"index","relevance_score"}]}` 与自建 FastAPI 服务的裸数组 `[{"index","score"}]`；端点由 `MEMORYSUM_RERANK_BASE_URL` 指定（默认 `http://127.0.0.1:7997`），`reranker.instruction` 为空表示不给 cross-encoder 加任何指令前缀。**但当前 `reranker.enabled=false`**：在 BEAM 单 scope + 60 条英文事实查询上实测，本地 `bge-reranker-v2-m3`（568M，F16 GGUF，由 `convert_hf_to_gguf.py` 从 safetensors 转换）把 top-1 34→35/60、top-3 44→47、MRR 0.664→0.682，**修复 10 条同时弄坏 9 条（净 +1）**，而 p50 延迟从 71ms 涨到 1961ms（**28 倍**）；判断是“重排”而非“改进”——它常把同一主题的另一段代码排到前面，对单-gold 评测是损失，对真实使用未必有错，但净收益不足以抵消延迟。启动本地 rerank 服务：`llama-server -m bge-reranker-v2-m3-f16.gguf --reranking --pooling rank -fa on -c 8192 -ngl 99 --port 7997`（约 887MiB 显存）。另实测：rerank 输入带/不带 `Source role:/Passage:` 渲染前缀时 top-5 完全一致（5/5），故未改渲染。
+
 ## 实现原则
 
 - **Search 只返回历史证据**，不回答问题、不调用生成式模型，也不把答案伪装成记忆。

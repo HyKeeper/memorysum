@@ -154,6 +154,8 @@ class RuntimeSettings:
     debug: bool = False
     embedding_base_url: str = "http://127.0.0.1:7999/v1"
     embedding_api_key: SecretStr | None = None
+    rerank_base_url: str = "http://127.0.0.1:7997"
+    rerank_api_key: SecretStr | None = None
 
     @classmethod
     def from_environment(cls) -> RuntimeSettings:
@@ -190,6 +192,7 @@ class RuntimeSettings:
 
         api_key = os.getenv("OPENROUTER_API_KEY")
         embedding_api_key = os.getenv("MEMORYSUM_EMBEDDING_API_KEY")
+        rerank_api_key = os.getenv("MEMORYSUM_RERANK_API_KEY")
         return cls(
             data_root=Path(os.getenv("MEMORYSUM_DATA_ROOT", "./data")).expanduser().resolve(),
             openrouter_base_url=os.getenv(
@@ -205,6 +208,10 @@ class RuntimeSettings:
                 "MEMORYSUM_EMBEDDING_BASE_URL", "http://127.0.0.1:7999/v1"
             ).rstrip("/"),
             embedding_api_key=SecretStr(embedding_api_key) if embedding_api_key else None,
+            rerank_base_url=os.getenv("MEMORYSUM_RERANK_BASE_URL", "http://127.0.0.1:7997").rstrip(
+                "/"
+            ),
+            rerank_api_key=SecretStr(rerank_api_key) if rerank_api_key else None,
         )
 
 

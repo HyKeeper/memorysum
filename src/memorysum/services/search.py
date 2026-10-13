@@ -1025,7 +1025,12 @@ class SearchService:
 
     def _rerank_query(self, query: str, options: Sequence[str]) -> str:
         question = query_options_text(query, list(options) if options else None)
-        return self._pipeline.reranker.instruction + "\n\nQuestion and options:\n" + question
+        instruction = self._pipeline.reranker.instruction.strip()
+        if not instruction:
+            # Cross-encoders such as bge-reranker take a bare query; only models
+            # that expect an instruction template (e.g. Qwen3-Reranker) need one.
+            return question
+        return instruction + "\n\nQuestion and options:\n" + question
 
     def _result_cache_key(
         self,
