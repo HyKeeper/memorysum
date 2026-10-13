@@ -1,13 +1,13 @@
 {
-  "pipeline_id": "memorysum-openrouter-preview-v0.3.0",
+  "pipeline_id": "memorysum-hybrid-preview-v0.5.0",
   "qualification_status": "provisional",
   "language": "textual",
   "generation_enabled": false,
   "embedding": {
-    "provider": "openrouter",
-    "model": "liquid/lfm-2.5-embedding-350m:free",
+    "provider": "local-openai",
+    "model": "qwen3-embedding-4b",
     "dimension": "auto-detect-on-first-successful-embedding",
-    "query_instruction": "Retrieve original memory passages relevant to this question, including necessary entities, dates, preferences, conditions, and exceptions.",
+    "query_instruction": "Instruct: Given a search query, retrieve relevant memories that answer the query\nQuery:",
     "document_instruction": null,
     "batch_items": 10,
     "batch_proxy_tokens": 8192,
@@ -15,8 +15,9 @@
     "sparse_output": false
   },
   "reranker": {
+    "enabled": false,
     "provider": "openrouter",
-    "model": "nvidia/llama-nemotron-rerank-vl-1b-v2:free",
+    "model": "qwen/qwen3-reranker-8b",
     "instruction": "Retrieve original memory evidence relevant to the question and all provided options, including necessary context, dates, conditions, and exceptions.",
     "tokenizer": "cl100k_base",
     "tokenizer_is_approximate": true,

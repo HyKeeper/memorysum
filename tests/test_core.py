@@ -12,8 +12,11 @@ from memorysum.core.errors import ProviderError
 from memorysum.core.ranking import reciprocal_rank_fusion
 from memorysum.core.rendering import render_response_spans
 from memorysum.core.vector import normalize_batch
+from memorysum.providers.factory import build_provider, embedding_endpoint
+from memorysum.providers.local_openai import LocalEmbeddingProvider
 from memorysum.providers.openrouter import OpenRouterProvider
 from memorysum.providers.protocols import RerankScore
+from memorysum.providers.split import SplitProvider
 from memorysum.settings import RuntimeSettings, load_pipeline_config
 
 
@@ -137,3 +140,116 @@ def test_openrouter_adapter_uses_expected_wire_contract_without_network():
     assert rerank_request["documents"] == [{"text": "first"}, {"text": "second"}]
     assert rerank_request["top_n"] == 2
     assert requests[0].headers["authorization"] == "Bearer test-provider-key"
+
+
+def _local_runtime(**overrides) -> RuntimeSettings:
+    values = {
+        "data_root": Path("/tmp/memorysum-local-provider-test"),
+        "openrouter_base_url": "https://openrouter.ai/api/v1",
+        "openrouter_api_key": SecretStr("test-provider-key"),
+        "api_auth_scheme": "bearer",
+        "api_auth_tokens": (SecretStr("test-memory-system-key"),),
+        "host": "127.0.0.1",
+        "port": 8001,
+        "embedding_base_url": "http://127.0.0.1:7999/v1",
+    }
+    values.update(overrides)
+    return RuntimeSettings(**values)
+
+
+def test_local_embedding_adapter_uses_openai_compatible_contract_without_network():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3.0, 4.0]}]})
+
+    provider = LocalEmbeddingProvider(
+        _local_runtime(embedding_api_key=None),
+        load_pipeline_config(),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert provider.embed(["source passage"])[0] == [3.0, 4.0]
+        with pytest.raises(ProviderError) as error:
+            provider.rerank("question", ["first"])
+        assert error.value.code == "model_provider_not_configured"
+    finally:
+        provider.close()
+
+    request = requests[0]
+    assert request.url.host == "127.0.0.1"
+    assert request.url.port == 7999
+    assert request.url.path == "/v1/embeddings"
+    payload = json.loads(request.content)
+    assert payload["model"] == load_pipeline_config().embedding.model
+    assert payload["input"] == ["source passage"]
+    assert payload["encoding_format"] == "float"
+    assert "authorization" not in request.headers
+
+
+def test_local_embedding_adapter_sends_optional_bearer_key():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0, 0.0]}]})
+
+    provider = LocalEmbeddingProvider(
+        _local_runtime(embedding_api_key=SecretStr("local-embedding-secret")),
+        load_pipeline_config(),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        provider.embed(["passage"])
+    finally:
+        provider.close()
+
+    assert requests[0].headers["authorization"] == "Bearer local-embedding-secret"
+
+
+def test_provider_factory_splits_local_embeddings_from_remote_rerank():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if request.url.path.endswith("/embeddings"):
+            return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3.0, 4.0]}]})
+        return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.7}]})
+
+    pipeline = load_pipeline_config()
+    provider = build_provider(
+        _local_runtime(),
+        pipeline,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert isinstance(provider, SplitProvider)
+        assert provider.embed(["passage"]) == [[3.0, 4.0]]
+        assert provider.rerank("question", ["first"]) == [RerankScore(0, 0.7)]
+    finally:
+        provider.close()
+
+    assert calls[0] == "http://127.0.0.1:7999/v1/embeddings"
+    assert calls[1] == "https://openrouter.ai/api/v1/rerank"
+
+
+def test_embedding_endpoint_follows_the_configured_provider():
+    pipeline = load_pipeline_config()
+    runtime = _local_runtime()
+    assert pipeline.embedding.provider == "local-openai"
+    assert embedding_endpoint(runtime, pipeline) == "http://127.0.0.1:7999/v1"
+
+    remote_pipeline = pipeline.model_copy(
+        update={"embedding": pipeline.embedding.model_copy(update={"provider": "openrouter"})}
+    )
+    assert embedding_endpoint(runtime, remote_pipeline) == "https://openrouter.ai/api/v1"
+
+
+def test_factory_rejects_unknown_provider_in_config():
+    pipeline = load_pipeline_config()
+    broken = pipeline.model_copy(
+        update={"reranker": pipeline.reranker.model_copy(update={"provider": "mystery"})}
+    )
+    with pytest.raises(ValueError, match="Unsupported model provider"):
+        build_provider(_local_runtime(), broken)

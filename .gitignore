@@ -11,6 +11,7 @@ venv/
 !.env.example
 keys.txt
 keys.*.txt
+keys.txt.*
 /data/
 data/
 logs/

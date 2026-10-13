@@ -43,6 +43,8 @@ class EmbeddingConfig(FrozenConfig):
 
 
 class RerankerConfig(FrozenConfig):
+    #: Set false to stop after fusion (no rerank model call, score = RRF score).
+    enabled: bool = True
     provider: str
     model: str
     instruction: str
@@ -158,6 +160,8 @@ class RuntimeSettings:
     host: str
     port: int
     debug: bool = False
+    embedding_base_url: str = "http://127.0.0.1:7999/v1"
+    embedding_api_key: SecretStr | None = None
 
     @classmethod
     def from_environment(cls) -> RuntimeSettings:
@@ -193,6 +197,7 @@ class RuntimeSettings:
         debug = debug_value in {"1", "true", "yes", "on"}
 
         api_key = os.getenv("OPENROUTER_API_KEY")
+        embedding_api_key = os.getenv("MEMORYSUM_EMBEDDING_API_KEY")
         return cls(
             data_root=Path(os.getenv("MEMORYSUM_DATA_ROOT", "./data")).expanduser().resolve(),
             openrouter_base_url=os.getenv(
@@ -204,6 +209,10 @@ class RuntimeSettings:
             host=os.getenv("MEMORYSUM_HOST", "0.0.0.0"),
             port=8001,
             debug=debug,
+            embedding_base_url=os.getenv(
+                "MEMORYSUM_EMBEDDING_BASE_URL", "http://127.0.0.1:7999/v1"
+            ).rstrip("/"),
+            embedding_api_key=SecretStr(embedding_api_key) if embedding_api_key else None,
         )
 
 

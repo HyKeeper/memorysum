@@ -2,15 +2,17 @@
 
 面向记忆检索系统开发的原文记忆服务，提供与 AML Text Add / Search 兼容的 API 形状。当前仓库侧重本机开发与真实服务链路验证，不代表任何比赛成绩。
 
-> **当前算法版本：`memorysum-openrouter-preview-v0.3.0`（provisional）**
-> 本地开发暂用 OpenRouter 的 `liquid/lfm-2.5-embedding-350m:free` 与 `nvidia/llama-nemotron-rerank-vl-1b-v2:free`。免费路由的可用性、吞吐与数据处理条款尚未完成正式评估。冻结规格要求的 text-embedding-v4 512 维稠密+稀疏向量、Qwen3-Reranker 官方模板/tokenizer 校验尚未接入。因此配置会自动探测维度、关闭 sparse，并使用 `cl100k_base` 估算 rerank pair tokens。为适配临时 LFM 路由，context 窗口暂缩为 target 320 / max 384 proxy tokens，和冻结 Champion v1 的窗口参数不同；当前版本不能描述成已通过正式模型验收。
+> **当前算法版本：`memorysum-hybrid-preview-v0.5.0`（provisional）**
+> embedding 走本机 llama.cpp 服务的 `qwen3-embedding-4b`（OpenAI 兼容 `/v1/embeddings`，F16 GGUF、`--pooling last`、2560 维，地址见 `MEMORYSUM_EMBEDDING_BASE_URL`，默认 `http://127.0.0.1:7999/v1`），零调用成本：实测单条 query 约 25ms、10 窗口批次 0.3–0.55s、3000 窗口的 Add 约 79s。reranker 仍走 OpenRouter 的 `qwen/qwen3-reranker-8b`（计费路由约 $0.2/M token，实测单次检索 64 个候选约 $0.0016）。冻结规格要求的 text-embedding-v4 512 维稠密+稀疏向量尚未接入（sparse 关闭）；reranker 的 Qwen3-Reranker-8B 虽在规格内，但走 OpenRouter 托管端点，**官方模板的 `<Instruct>` 槽位不可用**（实测传入 `instruction` 字段被忽略，token 数与打分均不变），instruction 仍拼接在 query 文本里，tokenizer 校验也仍用 `cl100k_base` 近似。维度自动探测（qwen3-embedding-4b 为 2560 维）。查询侧用 Qwen3 官方 `Instruct: …\nQuery:` 模板；本地服务 `-ctk/-ctv q8_0` 的 KV cache 会给同一 query 带来约 3.5e-4 的跨请求余弦漂移（比检索 margin 小两个数量级）。context 窗口仍为 target 320 / max 384 proxy tokens（当初为适配 LFM 路由而缩窄，未回退到冻结 Champion v1 参数）；当前版本不能描述成已通过正式模型验收。
+
+> **rerank 开关（省钱测试模式）**：`champion-v1.json` 的 `reranker.enabled` 控制是否调用精排模型，当前为 **`false`**——Search 在 RRF 融合后直接输出，**不再请求 OpenRouter**。此时 `SearchItem.score` 是 RRF 融合分（`Σ weight/(k+rank)`，通常 < 0.1），而不是 rerank 打分；`api_search` 日志新增 `reranked=%s` 字段用于区分，`rerank_groups` 仍是进入候选池的条数。开关只改变排序，不改变向量/窗口/索引，因此 `pipeline_id` 不变、已有数据无需迁移；但同一 `pipeline_id` 下两种模式的 score 语义不同，跑评测对比时须按 `reranked` 字段分组。
 
 ## 实现原则
 
 - **Search 只返回历史证据**，不回答问题、不调用生成式模型，也不把答案伪装成记忆。
 - **原文优先**：存储原始消息，窗口只保存指向原文的 Unicode 半开区间；输出可回溯到原消息。
 - **按 `user_id` 物理隔离**：每个用户使用一个 SQLite 文件，路径只包含 user ID 的 SHA-256；请求幂等、epoch 发布、FTS/向量安装在同一发布事务中。
-- **模型可替换**：HTTP 服务只依赖 `ModelProvider` 协议，OpenRouter 的路径、请求体和响应解析集中在 `providers/openrouter.py`。
+- **模型可替换**：HTTP 服务只依赖 `ModelProvider` 协议；远程供应商的路径、请求体和响应解析集中在 `providers/openrouter.py`，本地 OpenAI 兼容端点（llama.cpp / vLLM / LM Studio）在 `providers/local_openai.py`，二者按 `champion-v1.json` 的 provider 名由 `providers/factory.py` 组装（本地 embedding + 远程 rerank 用 `SplitProvider` 拼接；`reranker.enabled=false` 时精排层整段跳过）。
 - **不静默降级**：embedding 或 rerank 失败时 Add/Search 返回非 2xx，不把“模型失败”伪装成成功的词法检索。
 - **参数可审计**：算法配置在 `src/memorysum/config/champion-v1.json`，环境变量只用于密钥、服务地址、数据目录和入站鉴权。
 
@@ -89,9 +91,9 @@ curl -sS http://127.0.0.1:8001/search \
 
 1. 严格校验 AML 文本 Add / Search 字段、消息角色、时间戳和容量边界。
 2. 以确定性 embedding-token 代理构造 leaf/context 双尺度窗口；句子、标题、列表、表格、代码和引用会映射为精确原文 atom，context 窗口只在同一 Add 请求中按源序跨消息组合，最多 4 个 source spans。
-3. OpenRouter embedding 批量请求；校验 vector 个数、维度、finite/norm，并按 float32 归一化存入 `sqlite-vec`。
+3. embedding 批量请求（provider 由配置决定：本地 OpenAI 兼容端点或 OpenRouter）；校验 vector 个数、维度、finite/norm，并按 float32 归一化存入 `sqlite-vec`。
 4. SQLite FTS5 英文词法 + Jieba/中文 bigram 词法与双尺度 dense 召回，按 RRF 排名；options 作为受限词法提名。
-5. 对同消息相交窗口合并；跨消息 context groups 保留清晰 span 边界并受窗口数限制，再经 OpenRouter rerank；任何批次失败都不返回部分排序。
+5. 对同消息相交窗口合并；跨消息 context groups 保留清晰 span 边界并受窗口数限制，再经 reranker（当前为 OpenRouter）打分；任何批次失败都不返回部分排序。
 6. 宽泛/上下文检索在预算内可按消息返回完整原文；普通检索按 rerank 排序、`top_k`、证据组与 prompt 预算选择原文片段，不把元数据标签拼进 API 正文。
 7. 新 Add 通过入口 epoch 与原子发布隔离；用户数据从首次接收起 30 天固定 TTL，过期后退休并清理 SQLite/WAL/SHM。
 

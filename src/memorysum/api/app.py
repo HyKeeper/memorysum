@@ -21,7 +21,7 @@ from memorysum.api.schemas import AddRequest, AddResponse, SearchRequest, Search
 from memorysum.core.errors import ScopeRetired, ServiceError
 from memorysum.core.identity import scope_id
 from memorysum.core.text import chinese_terms, reader_token_count
-from memorysum.providers.openrouter import OpenRouterProvider
+from memorysum.providers.factory import build_provider, embedding_endpoint
 from memorysum.providers.protocols import ModelProvider
 from memorysum.services.add import AddService
 from memorysum.services.search import SearchService
@@ -106,9 +106,9 @@ def create_app(
     reader_token_count("memorysum tokenizer startup probe")
     chinese_terms("记忆检索")
     owns_provider = provider is None
-    provider = provider or OpenRouterProvider(runtime, pipeline)
+    provider = provider or build_provider(runtime, pipeline)
     embedding_space_id = hashlib.sha256(
-        (pipeline.embedding_space_id + "\n" + runtime.openrouter_base_url).encode("utf-8")
+        (pipeline.embedding_space_id + "\n" + embedding_endpoint(runtime, pipeline)).encode("utf-8")
     ).hexdigest()
     database = DatabaseManager(runtime.data_root, pipeline, embedding_space_id)
     services = _Services(
@@ -186,7 +186,11 @@ def create_app(
 
     @app.get("/health", response_model=None)
     def health() -> dict[str, str] | JSONResponse:
-        if services.owns_provider and runtime.openrouter_api_key is None:
+        needs_openrouter = "openrouter" in {
+            pipeline.embedding.provider,
+            pipeline.reranker.provider,
+        }
+        if services.owns_provider and needs_openrouter and runtime.openrouter_api_key is None:
             return JSONResponse(
                 status_code=503,
                 content={"status": "unavailable"},
@@ -320,7 +324,8 @@ def create_app(
             "event=api_search trace_id=%s pipeline=%s status=200 query_chars=%d "
             "options=%d options_chars=%d top_k=%d strategy=%s cache_hit=%s wide=%s "
             "context=%s full_tokens_est=%d channel_hits=%s candidate_windows=%d "
-            "rerank_groups=%d rerank_pair_tokens_est=%d returned=%d returned_chars=%d latency_ms=%d",
+            "reranked=%s rerank_groups=%d rerank_pair_tokens_est=%d returned=%d "
+            "returned_chars=%d latency_ms=%d",
             trace_id,
             pipeline.pipeline_id,
             len(payload.query),
@@ -334,6 +339,7 @@ def create_app(
             int(diagnostics.get("full_bundle_tokens_est", 0)),
             str(diagnostics.get("channel_hits", {})),
             int(diagnostics.get("candidate_windows", 0)),
+            bool(diagnostics.get("reranked", False)),
             int(diagnostics.get("rerank_groups", 0)),
             int(diagnostics.get("rerank_pair_tokens_est", 0)),
             len(response.data),

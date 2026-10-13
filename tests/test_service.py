@@ -59,7 +59,7 @@ class FruitProvider(FakeProvider):
         ]
 
 
-def make_app(data_root: Path, provider: FakeProvider):
+def make_app(data_root: Path, provider: FakeProvider, *, rerank_enabled: bool = True):
     runtime = RuntimeSettings(
         data_root=data_root,
         openrouter_base_url="https://openrouter.ai/api/v1",
@@ -69,9 +69,14 @@ def make_app(data_root: Path, provider: FakeProvider):
         host="127.0.0.1",
         port=8001,
     )
+    pipeline = load_pipeline_config()
+    if pipeline.reranker.enabled != rerank_enabled:
+        pipeline = pipeline.model_copy(
+            update={"reranker": pipeline.reranker.model_copy(update={"enabled": rerank_enabled})}
+        )
     return create_app(
         runtime=runtime,
-        pipeline=load_pipeline_config(),
+        pipeline=pipeline,
         provider=provider,
         start_cleanup=False,
     )
@@ -353,3 +358,42 @@ def test_search_reranks_bounded_context_groups_across_messages(tmp_path):
         )
         assert empty.status_code == 200
         assert empty.json() == {"data": []}
+
+
+def test_rerank_disabled_skips_provider_and_scores_with_fusion(tmp_path):
+    provider = FakeProvider()
+    app = make_app(tmp_path / "data", provider, rerank_enabled=False)
+    payload = {
+        "request_id": "add-1",
+        "user_id": "no-rerank-user",
+        "session_id": "session-1",
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": 1704067200000,
+                "content": "I prefer tea in the morning.",
+            },
+            {
+                "role": "user",
+                "timestamp": 1704067201000,
+                "content": "I also drink coffee in the afternoon.",
+            },
+        ],
+    }
+
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        assert client.post("/add", json=payload).status_code == 200
+        searched = client.post(
+            "/search",
+            json={"query": "What do I prefer?", "user_id": "no-rerank-user", "top_k": 10},
+        )
+
+    assert searched.status_code == 200
+    # The rerank model must never be called when the layer is disabled.
+    assert provider.rerank_batches == []
+    items = searched.json()["data"]
+    assert items
+    assert "I prefer tea" in items[0]["content"]
+    # Scores come from reciprocal-rank fusion, not from a rerank logit, so every
+    # value stays far below the [0, 1] range the test provider hands out.
+    assert all(0.0 < item["score"] < 0.5 for item in items)

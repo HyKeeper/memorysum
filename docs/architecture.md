@@ -8,7 +8,10 @@ api/app.py
   ├── services/add.py            # Add 生命周期与原子发布
   ├── services/search.py         # 可见 epoch、召回、rerank、输出预算
   ├── providers/protocols.py     # embedding/rerank 接口
-  │     └── providers/openrouter.py
+  │     ├── providers/factory.py   # 按 champion-v1.json 的 provider 名选实现
+  │     ├── providers/openrouter.py # 远程 embedding/rerank（OpenRouter wire format）
+  │     ├── providers/local_openai.py  # 本地 OpenAI 兼容 /v1/embeddings（llama.cpp 等）
+  │     └── providers/split.py     # 本地 embedding + 远程 rerank 的组合
   └── storage/database.py        # user_id 路由、SQLite 生命周期、sqlite-vec
 
 core/
@@ -23,7 +26,7 @@ core/
   └── cache.py                   # 有界进程内 TTL/LRU
 ```
 
-业务层不拼 OpenRouter URL，不直接生成回答；provider 层不访问 SQLite；存储层不知道 rerank 策略。新增实际供应商时，增加 `ModelProvider` 实现并在 app wiring 中替换，不把供应商字段散落进 Add/Search 代码。
+业务层不拼 OpenRouter URL，不直接生成回答；provider 层不访问 SQLite；存储层不知道 rerank 策略。新增实际供应商时，增加 `ModelProvider` 实现并在 `providers/factory.py` 中登记，不把供应商字段散落进 Add/Search 代码。embedding 与 rerank 可来自不同供应商：`provider: "local-openai"` 表示走 `MEMORYSUM_EMBEDDING_BASE_URL`（默认 `http://127.0.0.1:7999/v1`）的本地 OpenAI 兼容端点，此时 rerank 仍可由 OpenRouter 承担，两者由 `SplitProvider` 拼成单个 `ModelProvider`；参与 `embedding_space_id` 指纹的是 embedding 一边的端点地址。
 
 ## Add 状态流
 

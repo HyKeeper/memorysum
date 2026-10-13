@@ -179,20 +179,12 @@ class SearchService:
             if entries is not None:
                 diagnostics["strategy"] = "full_bundle"
                 diagnostics["full_bundle_tokens_est"] = full_bundle.token_cost
+                diagnostics["reranked"] = self._pipeline.reranker.enabled
                 diagnostics["rerank_groups"] = len(entries)
                 diagnostics["rerank_pair_tokens_est"] = sum(
                     entry.pair_proxy_tokens for entry in entries
                 )
-                rerank_query = self._rerank_query(request.query, options)
-                scores = self._rerank_entries(rerank_query, entries, deadline)
-                ranked = sorted(
-                    zip(entries, scores, strict=True),
-                    key=lambda pair: (
-                        -pair[1],
-                        -pair[0].candidate.score,
-                        pair[0].view_id,
-                    ),
-                )
+                ranked = self._rank_entries(entries, request.query, options, deadline)
                 response = self._select_output(ranked, request.top_k, mode, question_cost)
                 diagnostics["returned_records"] = len(response.data)
                 diagnostics["returned_chars"] = sum(len(item.content) for item in response.data)
@@ -231,6 +223,7 @@ class SearchService:
         )
         diagnostics["candidate_windows"] = len(fused)
         entries = self._prepare_rerank_entries(fused, rows, request, options, wide_mode)
+        diagnostics["reranked"] = self._pipeline.reranker.enabled
         diagnostics["rerank_groups"] = len(entries)
         diagnostics["rerank_pair_tokens_est"] = sum(entry.pair_proxy_tokens for entry in entries)
         if not entries:
@@ -240,20 +233,7 @@ class SearchService:
             self._results.set(result_cache_key, response)
             return response
 
-        rerank_query = self._rerank_query(request.query, options)
-        scores = self._rerank_entries(
-            rerank_query,
-            entries,
-            deadline,
-        )
-        ranked = sorted(
-            zip(entries, scores, strict=True),
-            key=lambda pair: (
-                -pair[1],
-                -pair[0].candidate.score,
-                pair[0].view_id,
-            ),
-        )
+        ranked = self._rank_entries(entries, request.query, options, deadline)
         response = self._select_output(ranked, request.top_k, mode, question_cost)
         diagnostics["returned_records"] = len(response.data)
         diagnostics["returned_chars"] = sum(len(item.content) for item in response.data)
@@ -891,6 +871,32 @@ class SearchService:
             if len(selected) >= max_groups:
                 break
         return selected
+
+    def _rank_entries(
+        self,
+        entries: Sequence[RerankEntry],
+        query: str,
+        options: Sequence[str],
+        deadline: float,
+    ) -> list[tuple[RerankEntry, float]]:
+        """Order entries: by rerank score when enabled, else keep fusion order.
+
+        With `reranker.enabled = false` the pipeline stops after reciprocal-rank
+        fusion and the returned score is the fusion score itself; no rerank
+        request is issued, so no provider quota is spent.
+        """
+        if not self._pipeline.reranker.enabled:
+            return [(entry, entry.candidate.score) for entry in entries]
+        rerank_query = self._rerank_query(query, options)
+        scores = self._rerank_entries(rerank_query, entries, deadline)
+        return sorted(
+            zip(entries, scores, strict=True),
+            key=lambda pair: (
+                -pair[1],
+                -pair[0].candidate.score,
+                pair[0].view_id,
+            ),
+        )
 
     def _rerank_entries(
         self,
