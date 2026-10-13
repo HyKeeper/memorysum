@@ -144,6 +144,12 @@ class SearchItem(BaseModel):
     content: str
     score: float
     created_at: str
+    #: Harness identifiers of the originating messages (LoCoMo "D1:3", BEAM
+    #: "1:msg7", PersonaMem "m3"), lifted from each chunk's metadata header at Add
+    #: time. Empty when the stored message carried no header. The platform resolves
+    #: a hit to its gold turn from these ids, so omitting them costs recall even
+    #: when retrieval is correct.
+    source_ids: list[str] = Field(default_factory=list)
 
 
 class SearchResponse(BaseModel):

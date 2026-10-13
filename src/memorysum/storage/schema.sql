@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS messages (
     source_timestamp_ms INTEGER,
     raw_content TEXT NOT NULL CHECK (length(raw_content) > 0),
     reader_token_est INTEGER NOT NULL DEFAULT 0 CHECK (reader_token_est >= 0),
+    -- Harness header lifted at Add time: JSON array of source ids (e.g. ["D1:1","D1:2"])
+    -- and the first non-empty line after the header (the time anchor).
+    metadata_ids TEXT,
+    metadata_anchor TEXT,
     CHECK (
         (timestamp_provided = 0 AND source_timestamp_ms IS NULL)
         OR (timestamp_provided = 1 AND source_timestamp_ms IS NOT NULL)

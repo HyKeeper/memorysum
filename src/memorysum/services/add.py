@@ -22,6 +22,7 @@ from memorysum.core.errors import (
     StorageError,
 )
 from memorysum.core.identity import source_id
+from memorysum.core.metadata import parse_chunk_metadata
 from memorysum.core.rendering import message_token_estimate
 from memorysum.core.text import proxy_tokens
 from memorysum.core.vector import normalize_batch, vector_to_blob
@@ -214,11 +215,16 @@ class AddService:
         for ordinal, message in enumerate(request.messages):
             public_id = source_id(request.user_id, request.request_id, ordinal)
             timestamp_ms = message.timestamp if "timestamp" in message.model_fields_set else None
+            # Lift the harness header (source ids + time anchor) once at write time so
+            # Search can return them as structured fields instead of relying on the
+            # platform to parse the header back out of the returned text.
+            header = parse_chunk_metadata(message.content)
             cursor = connection.execute(
                 """INSERT INTO messages(
                        public_source_id, request_id, ordinal, role, timestamp_provided,
-                       source_timestamp_ms, raw_content, reader_token_est
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       source_timestamp_ms, raw_content, reader_token_est,
+                       metadata_ids, metadata_anchor
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     public_id,
                     request.request_id,
@@ -228,6 +234,10 @@ class AddService:
                     timestamp_ms,
                     message.content,
                     render_estimates[ordinal],
+                    json.dumps(list(header.identifiers), ensure_ascii=False)
+                    if header.identifiers
+                    else None,
+                    header.anchor,
                 ),
             )
             message_ids[ordinal] = int(cursor.lastrowid)

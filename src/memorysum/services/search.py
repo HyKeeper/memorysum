@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import re
@@ -23,6 +24,7 @@ from memorysum.core.errors import (
     StorageError,
 )
 from memorysum.core.identity import canonical_json, scope_id
+from memorysum.core.metadata import attach_anchor
 from memorysum.core.query_modes import is_context_query, is_wide_query
 from memorysum.core.ranking import FusedCandidate, reciprocal_rank_fusion
 from memorysum.core.rendering import (
@@ -81,6 +83,40 @@ class RerankEntry:
     spans: list[dict[str, object]]
     created_at_ms: int
     pair_proxy_tokens: int
+    #: Harness ids of the originating messages (order preserved, de-duplicated).
+    source_ids: tuple[str, ...] = ()
+    #: Time anchor to re-attach when the rendered slice does not contain it.
+    anchor: str | None = None
+
+
+def entry_provenance(
+    spans: Sequence[Mapping[str, object]],
+) -> tuple[tuple[str, ...], str | None]:
+    """Collect the harness ids and time anchor carried by a window's source spans.
+
+    Ids are the union across spans (a context window can cover several messages),
+    order-preserving and de-duplicated. The anchor comes from the first span that
+    has one; it is re-attached at render time when the slice lost it.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    anchor: str | None = None
+    for span in spans:
+        raw = span.get("metadata_ids")
+        if raw:
+            try:
+                values = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                values = ()
+            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                for value in values:
+                    text = str(value)
+                    if text and text not in seen:
+                        seen.add(text)
+                        ids.append(text)
+        if anchor is None and span.get("metadata_anchor"):
+            anchor = str(span["metadata_anchor"])
+    return tuple(ids), anchor
 
 
 @dataclass
@@ -364,7 +400,10 @@ class SearchService:
                 "source_id": public_source_id,
                 "start_char": 0,
                 "end_char": len(response_content),
+                "metadata_ids": message["metadata_ids"],
+                "metadata_anchor": message["metadata_anchor"],
             }
+            source_ids, anchor = entry_provenance([span])
             entries.append(
                 RerankEntry(
                     candidate=FusedCandidate(
@@ -378,6 +417,8 @@ class SearchService:
                     spans=[span],
                     created_at_ms=created_at_ms,
                     pair_proxy_tokens=pair_cost,
+                    source_ids=source_ids,
+                    anchor=anchor,
                 )
             )
             spent += pair_cost
@@ -390,6 +431,7 @@ class SearchService:
                 rows = connection.execute(
                     """SELECT m.message_id, m.public_source_id, m.request_id, m.ordinal,
                               m.role, m.source_timestamp_ms, m.raw_content, m.reader_token_est,
+                              m.metadata_ids, m.metadata_anchor,
                               r.received_ms AS request_received_ms
                        FROM messages AS m
                        JOIN requests AS r ON r.request_id=m.request_id
@@ -587,7 +629,8 @@ class SearchService:
             f"""SELECT s.window_id, s.ordinal AS span_ordinal, s.message_id,
                        s.start_char, s.end_char, m.public_source_id, m.request_id,
                        m.ordinal AS message_ordinal, m.role, m.source_timestamp_ms,
-                       m.raw_content, r.received_ms AS request_received_ms
+                       m.raw_content, r.received_ms AS request_received_ms,
+                       m.metadata_ids, m.metadata_anchor
                 FROM window_spans AS s
                 JOIN messages AS m ON m.message_id=s.message_id
                 JOIN requests AS r ON r.request_id=m.request_id
@@ -611,6 +654,8 @@ class SearchService:
                 "source_timestamp_ms": source["source_timestamp_ms"],
                 "request_received_ms": int(source["request_received_ms"]),
                 "raw_content": str(source["raw_content"]),
+                "metadata_ids": source["metadata_ids"],
+                "metadata_anchor": source["metadata_anchor"],
                 "atoms": [],
             }
             spans_by_window.setdefault(window_id, []).append(span)
@@ -854,6 +899,8 @@ class SearchService:
                     spans=spans,
                     created_at_ms=created_at_ms,
                     pair_proxy_tokens=pair_cost,
+                    source_ids=entry_provenance(source_spans)[0],
+                    anchor=entry_provenance(source_spans)[1],
                 )
 
         ordered = sorted(
@@ -1027,7 +1074,12 @@ class SearchService:
         for entry, score in ranked:
             if len(selected) >= max_records:
                 break
-            content_key = " ".join(entry.response_content.split()).casefold()
+            # Re-attach the chunk's time anchor when the rendered slice lost it
+            # (only the first window of a chunk carries it). The anchor is plain
+            # text such as "Session 1 (1:56 pm on 8 May, 2023)" — never a
+            # "Time: " prefix, which the platform strips from the response text.
+            content = attach_anchor(entry.response_content, entry.anchor)
+            content_key = " ".join(content.split()).casefold()
             if content_key in seen_content:
                 continue
             spans = entry.spans
@@ -1040,15 +1092,16 @@ class SearchService:
             )
             if already_covered:
                 continue
-            cost = reader_token_count(entry.response_content) + _RENDER_TOKEN_OVERHEAD
+            cost = reader_token_count(content) + _RENDER_TOKEN_OVERHEAD
             if spent + cost > memory_budget:
                 continue
             selected.append(
                 SearchItem(
                     id=entry.view_id,
-                    content=entry.response_content,
+                    content=content,
                     score=score,
                     created_at=utc_timestamp(entry.created_at_ms),
+                    source_ids=list(entry.source_ids),
                 )
             )
             spent += cost

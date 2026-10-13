@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -16,11 +17,57 @@ import sqlite_vec
 
 from memorysum.core.errors import PipelineMismatch, ScopeRetired, StorageError
 from memorysum.core.identity import scope_id
+from memorysum.core.metadata import parse_chunk_metadata
 from memorysum.settings import PipelineConfig
 
 logger = logging.getLogger(__name__)
 _GIB = 1024**3
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Add the harness-metadata columns to an existing v2 scope and backfill them.
+
+    Parsing the stored text is deterministic and needs no model calls, so an older
+    scope is upgraded in place rather than rebuilt. The migration is idempotent:
+    it re-checks for the columns and only bumps `user_version` after the backfill,
+    so an interrupted run simply retries on the next open.
+    """
+    columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(messages)")}
+    if "metadata_ids" not in columns:
+        connection.execute("ALTER TABLE messages ADD COLUMN metadata_ids TEXT")
+    if "metadata_anchor" not in columns:
+        connection.execute("ALTER TABLE messages ADD COLUMN metadata_anchor TEXT")
+
+    rows = connection.execute("SELECT message_id, raw_content FROM messages").fetchall()
+    backfilled = 0
+    for row in rows:
+        metadata = parse_chunk_metadata(str(row["raw_content"]))
+        if not metadata.identifiers and not metadata.anchor:
+            continue
+        connection.execute(
+            "UPDATE messages SET metadata_ids = ?, metadata_anchor = ? WHERE message_id = ?",
+            (
+                json.dumps(list(metadata.identifiers), ensure_ascii=False)
+                if metadata.identifiers
+                else None,
+                metadata.anchor,
+                int(row["message_id"]),
+            ),
+        )
+        backfilled += 1
+    # `PRAGMA user_version` joins the pending transaction, while the DDL above is
+    # implicitly committed: without an explicit commit the version bump is rolled
+    # back on close and the scope would migrate again (and re-scan) on every open.
+    connection.commit()
+    connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+    connection.commit()
+    logger.info(
+        "Migrated scope schema v2 -> v%d: %d/%d messages carry harness metadata",
+        _SCHEMA_VERSION,
+        backfilled,
+        len(rows),
+    )
 
 
 @dataclass(frozen=True)
@@ -529,8 +576,12 @@ class DatabaseManager:
     @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version != _SCHEMA_VERSION:
-            raise StorageError()
+        if version == _SCHEMA_VERSION:
+            return
+        if version == 2:
+            _migrate_v2_to_v3(connection)
+            return
+        raise StorageError()
 
     def _verify_manifest(
         self, connection: sqlite3.Connection, reference: ScopeRef, user_id: str

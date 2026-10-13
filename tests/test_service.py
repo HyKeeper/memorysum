@@ -131,7 +131,13 @@ def test_add_is_synchronous_idempotent_and_user_isolated(tmp_path):
         assert search.status_code == 200
         assert len(search.json()["data"]) == 1
         assert "I prefer tea" in search.json()["data"][0]["content"]
-        assert set(search.json()["data"][0]) == {"id", "content", "score", "created_at"}
+        assert set(search.json()["data"][0]) == {
+            "id",
+            "content",
+            "score",
+            "created_at",
+            "source_ids",
+        }
         # With the reranker enabled the returned score is the fused rank score
         # (1/(k+rerank_rank) + w/(k+rrf_rank)), not the raw rerank logit.
         fused_score = search.json()["data"][0]["score"]
@@ -225,7 +231,7 @@ def test_small_scope_narrow_search_returns_ranked_clean_items_and_obeys_top_k(tm
     assert len(narrow_top_one.json()["data"]) == 1
     assert "apple" in narrow_top_one.json()["data"][0]["content"].lower()
     assert all(
-        set(item) == {"id", "content", "score", "created_at"} for item in narrow_items
+        set(item) == {"id", "content", "score", "created_at", "source_ids"} for item in narrow_items
     )
     assert all(isinstance(item["score"], (int, float)) for item in narrow_items)
     assert all(isinstance(item["created_at"], str) for item in narrow_items)
@@ -247,7 +253,9 @@ def test_small_scope_narrow_search_returns_ranked_clean_items_and_obeys_top_k(tm
 
     broad_items = broad.json()["data"]
     assert set(item["content"] for item in broad_items) == set(source_messages[:-1])
-    assert all(set(item) == {"id", "content", "score", "created_at"} for item in broad_items)
+    assert all(
+        set(item) == {"id", "content", "score", "created_at", "source_ids"} for item in broad_items
+    )
     assert all(
         label not in item["content"]
         for item in broad_items
@@ -255,7 +263,10 @@ def test_small_scope_narrow_search_returns_ranked_clean_items_and_obeys_top_k(tm
     )
     limited_items = broad_limited.json()["data"]
     assert len(limited_items) == 2
-    assert all(set(item) == {"id", "content", "score", "created_at"} for item in limited_items)
+    assert all(
+        set(item) == {"id", "content", "score", "created_at", "source_ids"}
+        for item in limited_items
+    )
 
 
 def test_long_scope_uses_retrieval_and_reranker(tmp_path):
