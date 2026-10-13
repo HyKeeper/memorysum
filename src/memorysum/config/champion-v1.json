@@ -26,8 +26,18 @@
     "max_concurrency": 4
   },
   "chunking": {
-    "leaf": {"min": 128, "target": 256, "max": 320, "overlap": 64},
-    "context": {"min": 128, "target": 320, "max": 384, "overlap": 64}
+    "leaf": {
+      "min": 128,
+      "target": 256,
+      "max": 320,
+      "overlap": 64
+    },
+    "context": {
+      "min": 128,
+      "target": 320,
+      "max": 384,
+      "overlap": 64
+    }
   },
   "retrieval": {
     "rrf_k": 60,
@@ -58,7 +68,12 @@
       "candidate_cap": 512,
       "output_records": 100,
       "output_tokens": 49152
-    }
+    },
+    "neighbor_expand_chars": 0,
+    "similarity_weight": 0.0,
+    "consensus_weight": 0.0,
+    "speaker_weight": 0.0,
+    "per_source_cap": 1
   },
   "groups": {
     "max_spans": 4,

@@ -73,6 +73,27 @@ class RetrievalConfig(FrozenConfig):
     base_channel_weight: float
     #: Per-channel fusion weights; unlisted channels fall back to base_channel_weight.
     channel_weights: dict[str, float]
+    #: Weight of a channel's own similarity scores relative to its rank term. RRF
+    #: alone ignores confidence (a 0.9-similarity hit and a 0.3 one with the same
+    #: rank contribute identically); >0 min-max normalises each channel and adds
+    #: the score as a bounded tie-breaker. 0 = pure rank fusion.
+    similarity_weight: float = 0.0
+    #: Chunk-level agreement vote applied after ranking: an entry gains score when
+    #: other strong candidates come from the same source message. Multi-hop answers
+    #: often need two turns of one chunk, so this lifts that chunk's windows.
+    consensus_weight: float = 0.0
+    #: Boost windows dominated by a speaker the query names ("What did Melanie paint?").
+    #: 0 disables it. Uses the candidate text's own "Name:" prefixes.
+    speaker_weight: float = 0.0
+    #: Cap how many returned records may come from one source message (one chunk).
+    #: Multi-hop questions need evidence from several sessions, and an uncapped
+    #: ranking can fill the whole budget with windows of a single chatty chunk.
+    #: 0 disables the cap.
+    per_source_cap: int = 0
+    #: Widen every returned passage by N source characters on both sides. Neighbouring
+    #: text often holds the second half of a multi-hop answer, which leaf windows cut
+    #: away; 0 keeps the response byte-identical to the indexed window.
+    neighbor_expand_chars: int = 0
     ordinary: RetrievalModeConfig
     wide: RetrievalModeConfig
 

@@ -33,9 +33,7 @@ class RequestLoggingMiddleware:
         try:
             await self.app(scope, receive, log_response_start)
         finally:
-            timestamp = datetime.now(UTC).isoformat(timespec="milliseconds").replace(
-                "+00:00", "Z"
-            )
+            timestamp = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
             latency_ms = (time.perf_counter_ns() - started_ns) / 1_000_000
             logger.info(
                 "event=http_request timestamp=%s method=%s path=%s status=%d latency_ms=%.3f",

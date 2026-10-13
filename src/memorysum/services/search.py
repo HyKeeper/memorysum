@@ -9,6 +9,7 @@ import math
 import re
 import sqlite3
 import time
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -28,6 +29,7 @@ from memorysum.core.metadata import attach_anchor
 from memorysum.core.query_modes import is_context_query, is_wide_query
 from memorysum.core.ranking import FusedCandidate, reciprocal_rank_fusion
 from memorysum.core.rendering import (
+    _RESPONSE_SPAN_SEPARATOR,
     FULL_BUNDLE_SEPARATOR,
     full_bundle_token_cost,
     render_full_bundle,
@@ -87,6 +89,31 @@ class RerankEntry:
     source_ids: tuple[str, ...] = ()
     #: Time anchor to re-attach when the rendered slice does not contain it.
     anchor: str | None = None
+
+
+_SPEAKER_RE = re.compile(r"(?m)^([A-Z][a-z]{2,15}):\s")
+_WORD_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _word_re(name: str) -> re.Pattern[str]:
+    cached = _WORD_CACHE.get(name)
+    if cached is None:
+        cached = re.compile(rf"\b{re.escape(name)}\b")
+        _WORD_CACHE[name] = cached
+    return cached
+
+
+def _primary_message_id(entry: RerankEntry) -> str:
+    """Source message of an entry's first span, used for chunk-level consensus.
+
+    `entry.spans` carries the renderer's span identities (source_id / start / end),
+    so the message key here is `source_id` - the same key `_select_output` uses to
+    de-duplicate overlapping passages.
+    """
+    spans = entry.spans
+    if not spans:
+        return ""
+    return str(spans[0].get("source_id", ""))
 
 
 def entry_provenance(
@@ -256,6 +283,9 @@ class SearchService:
             channels,
             k=self._pipeline.retrieval.rrf_k,
             limit=mode.candidate_cap,
+            similarity_weight=float(
+                getattr(self._pipeline.retrieval, "similarity_weight", 0.0) or 0.0
+            ),
         )
         diagnostics["candidate_windows"] = len(fused)
         entries = self._prepare_rerank_entries(fused, rows, request, options, wide_mode)
@@ -512,14 +542,22 @@ class SearchService:
                 def weight(name: str) -> float:
                     return weights.get(name, fallback)
 
-                channels: list[tuple[str, list[int], float]] = [
-                    ("leaf_dense", leaf, weight("leaf_dense")),
-                    ("context_dense", context, weight("context_dense")),
+                channels: list[tuple[str, list[object], float]] = [
+                    ("leaf_dense", list(leaf), weight("leaf_dense")),
+                    ("context_dense", list(context), weight("context_dense")),
                     ("english_fts", en, weight("english_fts")),
                     ("chinese_fts", zh, weight("chinese_fts")),
                     ("options_lexical", option_ids, weight("options_lexical")),
                 ]
-                all_ids = sorted({window_id for _, ids, _ in channels for window_id in ids})
+                # Dense channels yield (window_id, similarity); lexical ones yield
+                # bare ids. Normalise here so both drive the same row fetch.
+                all_ids = sorted(
+                    {
+                        int(entry[0]) if isinstance(entry, (tuple, list)) else int(entry)
+                        for _, ids, _ in channels
+                        for entry in ids
+                    }
+                )
                 rows = self._load_window_rows(connection, all_ids, snapshot.epoch)
             return channels, rows
         except (PipelineMismatch, ScopeRetired, ServiceError):
@@ -537,7 +575,7 @@ class SearchService:
         query_vector: Sequence[float],
         epoch: int,
         limit: int,
-    ) -> list[int]:
+    ) -> list[tuple[int, float]]:
         if limit <= 0:
             return []
         blob = vector_to_blob(query_vector)
@@ -548,7 +586,11 @@ class SearchService:
             (blob, limit, epoch),
         ).fetchall()
         rows = sorted(rows, key=lambda row: (float(row["distance"]), int(row["rowid"])))
-        return [int(row["rowid"]) for row in rows]
+        # Negated distance: closer vectors must score higher once the fusion step
+        # min-max normalises the channel. Previously the distances were discarded
+        # and only ranks survived, which made a 0.9-similarity top hit weigh the
+        # same as a 0.3 one.
+        return [(int(row["rowid"]), -float(row["distance"])) for row in rows]
 
     @staticmethod
     def _fts_hits(
@@ -944,12 +986,13 @@ class SearchService:
             return [(entry, entry.candidate.score) for entry in entries]
         rerank_query = self._rerank_query(query, options)
         scores = self._rerank_entries(rerank_query, entries, deadline)
-        return self._fuse_rankings(entries, scores)
+        return self._fuse_rankings(entries, scores, query)
 
     def _fuse_rankings(
         self,
         entries: Sequence[RerankEntry],
         scores: Sequence[float],
+        query: str = "",
     ) -> list[tuple[RerankEntry, float]]:
         """Fuse rerank ranks with retrieval ranks; score = rerank + w * retrieval.
 
@@ -978,6 +1021,51 @@ class SearchService:
             )
             for index in range(len(entries))
         ]
+        alpha = float(getattr(self._pipeline.retrieval, "consensus_weight", 0.0) or 0.0)
+        speaker_alpha = float(getattr(self._pipeline.retrieval, "speaker_weight", 0.0) or 0.0)
+        if (alpha > 0 or speaker_alpha > 0) and len(fused) > 1:
+            high = max(score for _, score in fused) or 1.0
+            low = min(score for _, score in fused)
+            span = (high - low) or 1.0
+            normalised = [(entry, (score - low) / span) for entry, score in fused]
+
+            # Context-relationship vote: windows belonging to the same chunk as other
+            # strong candidates are likelier to hold the same answer, which is what
+            # multi-hop questions need (their two evidence turns usually sit in
+            # different windows of one chunk).
+            totals: dict[str, float] = defaultdict(float)
+            counts: dict[str, int] = defaultdict(int)
+            for entry, norm in normalised:
+                key = _primary_message_id(entry)
+                totals[key] += norm
+                counts[key] += 1
+
+            # Speakers named by the query: conversational questions usually target one
+            # participant ("What did Melanie paint?"), so windows dominated by that
+            # person's turns are better answers. Names are read off the candidate text
+            # itself, so this needs no extra indexing or per-dataset configuration.
+            targets: set[str] = set()
+            if speaker_alpha > 0:
+                names: set[str] = set()
+                for entry, _ in normalised:
+                    names.update(_SPEAKER_RE.findall(entry.response_content))
+                targets = {name for name in names if _word_re(name).search(query)}
+
+            boosted = []
+            for entry, norm in normalised:
+                score = norm
+                if alpha > 0:
+                    key = _primary_message_id(entry)
+                    others = counts[key] - 1
+                    if others > 0:
+                        score += alpha * ((totals[key] - norm) / others)
+                if targets:
+                    hits = sum(
+                        len(_word_re(name).findall(entry.response_content)) for name in targets
+                    )
+                    score += speaker_alpha * min(1.0, hits / 4.0)
+                boosted.append((entry, score))
+            fused = boosted
         return sorted(
             fused,
             key=lambda pair: (
@@ -1067,25 +1155,55 @@ class SearchService:
             ),
         )
         max_records = min(top_k, mode.output_records)
+        expand = max(0, self._pipeline.retrieval.neighbor_expand_chars)
+        per_source_cap = int(getattr(self._pipeline.retrieval, "per_source_cap", 0) or 0)
         selected: list[SearchItem] = []
         spent = 0
         covered: dict[str, list[tuple[int, int]]] = {}
         seen_content: set[str] = set()
+        source_counts: dict[str, int] = defaultdict(int)
+
+        def bounds(span: Mapping[str, object]) -> tuple[int, int]:
+            """Span interval widened by neighbor_expand_chars, clamped to the source text."""
+            left = max(0, int(span["start_char"]) - expand)
+            right = int(span["end_char"]) + expand
+            raw = span.get("raw_content")
+            if isinstance(raw, str) and raw:
+                right = min(right, len(raw))
+            return left, right
+
         for entry, score in ranked:
             if len(selected) >= max_records:
                 break
+            source_key = _primary_message_id(entry)
+            if per_source_cap and source_counts[source_key] >= per_source_cap:
+                # Budget spent on a chunk already represented; skip so evidence from
+                # other sessions can still make it into the response.
+                continue
             # Re-attach the chunk's time anchor when the rendered slice lost it
             # (only the first window of a chunk carries it). The anchor is plain
             # text such as "Session 1 (1:56 pm on 8 May, 2023)" — never a
             # "Time: " prefix, which the platform strips from the response text.
             content = attach_anchor(entry.response_content, entry.anchor)
+            spans = entry.spans
+            if expand:
+                # Widen each passage to its neighbouring text so a hit carries the
+                # context its own window cut off. Only the returned text changes;
+                # ranking still uses the indexed window.
+                widened = []
+                for span in spans:
+                    raw = span.get("raw_content")
+                    if isinstance(raw, str) and raw:
+                        left, right = bounds(span)
+                        widened.append(raw[left:right])
+                if widened:
+                    content = attach_anchor(_RESPONSE_SPAN_SEPARATOR.join(widened), entry.anchor)
             content_key = " ".join(content.split()).casefold()
             if content_key in seen_content:
                 continue
-            spans = entry.spans
             already_covered = all(
                 any(
-                    int(span["start_char"]) >= left and int(span["end_char"]) <= right
+                    bounds(span)[0] >= left and bounds(span)[1] <= right
                     for left, right in covered.get(str(span["source_id"]), [])
                 )
                 for span in spans
@@ -1106,10 +1224,9 @@ class SearchService:
             )
             spent += cost
             seen_content.add(content_key)
+            source_counts[source_key] += 1
             for span in spans:
-                covered.setdefault(str(span["source_id"]), []).append(
-                    (int(span["start_char"]), int(span["end_char"]))
-                )
+                covered.setdefault(str(span["source_id"]), []).append(bounds(span))
         return SearchResponse(data=selected)
 
     def _rerank_query(self, query: str, options: Sequence[str]) -> str:
