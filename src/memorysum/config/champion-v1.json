@@ -1,8 +1,6 @@
 {
   "pipeline_id": "memorysum-hybrid-preview-v0.5.0",
   "qualification_status": "provisional",
-  "language": "textual",
-  "generation_enabled": false,
   "embedding": {
     "provider": "local-openai",
     "model": "qwen3-embedding-4b",
@@ -11,16 +9,13 @@
     "document_instruction": null,
     "batch_items": 10,
     "batch_proxy_tokens": 8192,
-    "input_proxy_tokens": 4096,
-    "sparse_output": false
+    "input_proxy_tokens": 4096
   },
   "reranker": {
     "enabled": false,
     "provider": "openrouter",
     "model": "qwen/qwen3-reranker-8b",
     "instruction": "Retrieve original memory evidence relevant to the question and all provided options, including necessary context, dates, conditions, and exceptions.",
-    "tokenizer": "cl100k_base",
-    "tokenizer_is_approximate": true,
     "single_pair_proxy_tokens": 8192,
     "ordinary_pair_proxy_budget": 24000,
     "wide_pair_proxy_budget": 48000,
@@ -30,7 +25,6 @@
     "max_concurrency": 2
   },
   "chunking": {
-    "token_proxy": "unicode-word-cjk-char-punctuation-v1",
     "leaf": {"min": 128, "target": 256, "max": 320, "overlap": 64},
     "context": {"min": 128, "target": 320, "max": 384, "overlap": 64}
   },
@@ -63,9 +57,7 @@
       "candidate_cap": 512,
       "output_records": 100,
       "output_tokens": 49152
-    },
-    "unused_quota_transfer": false,
-    "sparse_channel": "disabled-by-provisional-embedding-provider"
+    }
   },
   "groups": {
     "max_spans": 4,
@@ -78,8 +70,7 @@
     "conditional_full_requires_wide_or_context_mode": true,
     "safe_input_tokens": 96000,
     "estimation_safety_factor": 1.25,
-    "platform_instruction_reserve": 8192,
-    "reader_estimator": "cl100k_base"
+    "platform_instruction_reserve": 8192
   },
   "capacity": {
     "max_body_bytes": 33554432,
@@ -95,15 +86,5 @@
     "scope_retention_days": 30,
     "cleanup_interval_seconds": 3600,
     "wal_autocheckpoint_pages": 1000
-  },
-  "features": {
-    "automatic_truth_supersede": false,
-    "automatic_forget": false,
-    "generation": false,
-    "seed_rerank": false,
-    "semantic_probe": false,
-    "option_dense": false,
-    "ann": false,
-    "cross_request_order_inference": false
   }
 }

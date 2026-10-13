@@ -68,3 +68,43 @@ def test_search_strictly_validates_top_k_and_options():
         SearchRequest.model_validate({**base, "options": [""]})
     with pytest.raises(ValidationError):
         SearchRequest.model_validate({**base, "options": ["A"] * 33})
+
+
+def test_wire_limits_track_pipeline_config():
+    """API 长度上限必须来自 pipeline config，而不是散落的硬编码常量。"""
+    from memorysum.api import schemas
+    from memorysum.settings import load_pipeline_config
+
+    capacity = load_pipeline_config().capacity
+    assert schemas._CAPACITY is capacity
+
+    def max_length(model, field_name):
+        for meta in model.model_fields[field_name].metadata:
+            if hasattr(meta, "max_length"):
+                return meta.max_length
+        return None
+
+    assert max_length(AddRequest, "messages") == capacity.max_add_messages
+    assert max_length(SearchRequest, "options") == capacity.max_search_options
+
+
+def test_pipeline_config_has_no_unread_fields():
+    """config 里不应再出现“声明了但代码从不读取”的装饰性字段。"""
+    from memorysum.settings import load_pipeline_config
+
+    dumped = load_pipeline_config().model_dump()
+    forbidden = {
+        "features",
+        "language",
+        "generation_enabled",
+    }
+    assert not (set(dumped) & forbidden), (
+        f"decorative top-level field reintroduced: {set(dumped) & forbidden}"
+    )
+    assert "sparse_output" not in dumped["embedding"]
+    assert "tokenizer" not in dumped["reranker"]
+    assert "tokenizer_is_approximate" not in dumped["reranker"]
+    assert "token_proxy" not in dumped["chunking"]
+    assert "unused_quota_transfer" not in dumped["retrieval"]
+    assert "sparse_channel" not in dumped["retrieval"]
+    assert "reader_estimator" not in dumped["coverage"]

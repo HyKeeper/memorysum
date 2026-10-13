@@ -15,6 +15,11 @@ from pydantic import (
 )
 
 from memorysum.core.identity import payload_hash
+from memorysum.settings import load_pipeline_config
+
+#: Wire limits come from the pipeline config so that the audited algorithm
+#: configuration stays the single source of truth.
+_CAPACITY = load_pipeline_config().capacity
 
 
 class StrictRequest(BaseModel):
@@ -49,7 +54,7 @@ class AddMessage(StrictRequest):
 
 class AddRequest(StrictRequest):
     request_id: StrictStr
-    messages: list[AddMessage] = Field(min_length=1, max_length=1024)
+    messages: list[AddMessage] = Field(min_length=1, max_length=_CAPACITY.max_add_messages)
     user_id: StrictStr
     session_id: StrictStr
 
@@ -86,7 +91,7 @@ class AddRequest(StrictRequest):
 
 class SearchRequest(StrictRequest):
     query: StrictStr
-    options: list[StrictStr] | None = Field(default=None, max_length=32)
+    options: list[StrictStr] | None = Field(default=None, max_length=_CAPACITY.max_search_options)
     user_id: StrictStr
     top_k: StrictInt = Field(ge=0)
 

@@ -25,7 +25,6 @@ class ChunkScaleConfig(FrozenConfig):
 
 
 class ChunkingConfig(FrozenConfig):
-    token_proxy: str
     leaf: ChunkScaleConfig
     context: ChunkScaleConfig
 
@@ -39,7 +38,6 @@ class EmbeddingConfig(FrozenConfig):
     batch_items: int
     batch_proxy_tokens: int
     input_proxy_tokens: int
-    sparse_output: bool
 
 
 class RerankerConfig(FrozenConfig):
@@ -48,8 +46,6 @@ class RerankerConfig(FrozenConfig):
     provider: str
     model: str
     instruction: str
-    tokenizer: str
-    tokenizer_is_approximate: bool
     single_pair_proxy_tokens: int
     ordinary_pair_proxy_budget: int
     wide_pair_proxy_budget: int
@@ -77,8 +73,6 @@ class RetrievalConfig(FrozenConfig):
     channel_weights: dict[str, float]
     ordinary: RetrievalModeConfig
     wide: RetrievalModeConfig
-    unused_quota_transfer: bool
-    sparse_channel: str
 
 
 class GroupConfig(FrozenConfig):
@@ -94,7 +88,6 @@ class CoverageConfig(FrozenConfig):
     safe_input_tokens: int
     estimation_safety_factor: float
     platform_instruction_reserve: int
-    reader_estimator: str
 
 
 class CapacityConfig(FrozenConfig):
@@ -116,8 +109,6 @@ class CapacityConfig(FrozenConfig):
 class PipelineConfig(FrozenConfig):
     pipeline_id: str
     qualification_status: Literal["provisional", "ready"]
-    language: Literal["textual"]
-    generation_enabled: bool
     embedding: EmbeddingConfig
     reranker: RerankerConfig
     chunking: ChunkingConfig
@@ -125,7 +116,6 @@ class PipelineConfig(FrozenConfig):
     groups: GroupConfig
     coverage: CoverageConfig
     capacity: CapacityConfig
-    features: dict[str, bool]
 
     @property
     def embedding_space_id(self) -> str:
