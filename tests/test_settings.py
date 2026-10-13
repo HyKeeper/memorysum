@@ -42,3 +42,30 @@ def test_runtime_rejects_tokens_with_whitespace(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("MEMORYSUM_API_KEYS_FILE", str(keys_file))
     with pytest.raises(ValueError, match="printable ASCII"):
         RuntimeSettings.from_environment()
+
+
+def test_pipeline_channel_weights_reference_known_channels():
+    from memorysum.settings import load_pipeline_config
+
+    pipeline = load_pipeline_config()
+    known = {"leaf_dense", "context_dense", "english_fts", "chinese_fts", "options_lexical"}
+    weights = pipeline.retrieval.channel_weights
+    assert set(weights) <= known, f"unknown channel in channel_weights: {set(weights) - known}"
+    assert all(value > 0 for value in weights.values()), "channel weights must be positive"
+
+
+def test_pipeline_falls_back_to_base_weight_for_unlisted_channels():
+    from memorysum.settings import load_pipeline_config
+
+    pipeline = load_pipeline_config()
+    unlisted = {
+        "leaf_dense",
+        "context_dense",
+        "english_fts",
+        "chinese_fts",
+        "options_lexical",
+    } - set(pipeline.retrieval.channel_weights)
+    for name in unlisted:
+        assert (
+            pipeline.retrieval.channel_weights.get(name, pipeline.retrieval.base_channel_weight) > 0
+        )

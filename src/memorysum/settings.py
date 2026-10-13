@@ -73,6 +73,8 @@ class RetrievalModeConfig(FrozenConfig):
 class RetrievalConfig(FrozenConfig):
     rrf_k: int
     base_channel_weight: float
+    #: Per-channel fusion weights; unlisted channels fall back to base_channel_weight.
+    channel_weights: dict[str, float]
     ordinary: RetrievalModeConfig
     wide: RetrievalModeConfig
     unused_quota_transfer: bool

@@ -37,6 +37,13 @@
   "retrieval": {
     "rrf_k": 60,
     "base_channel_weight": 1.0,
+    "channel_weights": {
+      "leaf_dense": 2.0,
+      "context_dense": 1.0,
+      "english_fts": 0.5,
+      "chinese_fts": 0.25,
+      "options_lexical": 1.0
+    },
     "ordinary": {
       "leaf_dense": 96,
       "context_dense": 48,

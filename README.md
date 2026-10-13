@@ -7,6 +7,8 @@
 
 > **rerank 开关（省钱测试模式）**：`champion-v1.json` 的 `reranker.enabled` 控制是否调用精排模型，当前为 **`false`**——Search 在 RRF 融合后直接输出，**不再请求 OpenRouter**。此时 `SearchItem.score` 是 RRF 融合分（`Σ weight/(k+rank)`，通常 < 0.1），而不是 rerank 打分；`api_search` 日志新增 `reranked=%s` 字段用于区分，`rerank_groups` 仍是进入候选池的条数。开关只改变排序，不改变向量/窗口/索引，因此 `pipeline_id` 不变、已有数据无需迁移；但同一 `pipeline_id` 下两种模式的 score 语义不同，跑评测对比时须按 `reranked` 字段分组。
 
+> **RRF 通道权重（实测调参，2026-10-13）**：`retrieval.channel_weights` 按通道加权（未列出的通道回退到 `base_channel_weight`），当前为 `leaf_dense 2.0 / context_dense 1.0 / english_fts 0.5 / chinese_fts 0.25 / options_lexical 1.0`。依据：在 BEAM 单 scope（1147 窗口）+ 60 条英文事实查询（hard negative 密集）上的离线评测——`rrf_k` 在 10–200 间对 top-1/top-3 无影响（RRF 的已知鲁棒性，故保持 60）；**leaf_dense 加权 + 降低词法通道权重**把 top-1 从 28/60 提到 34/60、MRR 0.565→0.664，且在两个半样本上各自成立（交叉验证否决了只在调参半区有效的过拟合解）。两个反直觉点：**① `chinese_fts` 并非中文专用**——它走 jieba 分词，对英文文本同样产出词项（实测 gold 召回 26/30、平均排名 4.2），权重降到 0 反而降到 32/60，故必须保留小权重；**② 收紧通道配额（zh 24→8、en 80→96、leaf 96→64）在实测中全部无益或有害**，未采用。
+
 ## 实现原则
 
 - **Search 只返回历史证据**，不回答问题、不调用生成式模型，也不把答案伪装成记忆。

@@ -464,12 +464,18 @@ class SearchService:
                     snapshot.epoch,
                     mode.options_lexical,
                 )
+                weights = self._pipeline.retrieval.channel_weights
+                fallback = self._pipeline.retrieval.base_channel_weight
+
+                def weight(name: str) -> float:
+                    return weights.get(name, fallback)
+
                 channels: list[tuple[str, list[int], float]] = [
-                    ("leaf_dense", leaf, self._pipeline.retrieval.base_channel_weight),
-                    ("context_dense", context, self._pipeline.retrieval.base_channel_weight),
-                    ("english_fts", en, self._pipeline.retrieval.base_channel_weight),
-                    ("chinese_fts", zh, self._pipeline.retrieval.base_channel_weight),
-                    ("options_lexical", option_ids, self._pipeline.retrieval.base_channel_weight),
+                    ("leaf_dense", leaf, weight("leaf_dense")),
+                    ("context_dense", context, weight("context_dense")),
+                    ("english_fts", en, weight("english_fts")),
+                    ("chinese_fts", zh, weight("chinese_fts")),
+                    ("options_lexical", option_ids, weight("options_lexical")),
                 ]
                 all_ids = sorted({window_id for _, ids, _ in channels for window_id in ids})
                 rows = self._load_window_rows(connection, all_ids, snapshot.epoch)
