@@ -15,6 +15,10 @@
 
 > **配置不变量**：`champion-v1.json` 只保留被代码真正读取的字段（已删除 `features` 整段、`language`、`generation_enabled`、`embedding.sparse_output`、`reranker.tokenizer`/`tokenizer_is_approximate`、`chunking.token_proxy`、`retrieval.unused_quota_transfer`/`sparse_channel`、`coverage.reader_estimator` 等纯装饰字段）；`capacity.max_add_messages`/`max_search_options` 由 `api/schemas.py` 直接读取，不再硬编码。改 embedding provider/model/instruction/dimension 或 window renderer **必须新建 `pipeline_id`**（否则旧 scope 一律 503 `pipeline_mismatch`）；只改排序参数（通道权重、融合权重、rerank 开关）则不必，已有数据仍可复用。
 
+> **Search 返回 harness 标识（2026-10-13）**：`SearchItem` 新增 **`source_ids`**——该命中涉及的各 chunk 级 id 之并集（保序去重；LoCoMo 形如 `D1:3`、BEAM 形如 `1:msg7`、PersonaMem 形如 `m3`），来自 Add 时对每个 chunk 元数据头的一次性解析（`core/metadata.py`，只读、不改写原文）。返回正文若不含该 chunk 的**时间锚点**（如 `Session 1 (1:56 pm on 8 May, 2023)`），会在首行补上——**不用 `Time:` 前缀**（平台会把以 `Time:` 开头的行整行删掉）。动机：平台优先用 item 上的 id 定位 gold，只有兜底才解析正文里的 META 头；而正文含头的窗口只占少数（实测 LoCoMo：3.4 窗口/chunk、27/93 个 leaf 窗口带头），把 id 显式返回可解除这个机制上限。**注意 ids 是 chunk 级**（头里只有 chunk 级 id，无法精确到 turn），因此比窗口粒度宽。
+>
+> **schema v3 就地迁移**：老 scope 在首次打开时自动补上 `metadata_ids` / `metadata_anchor` 两列并从原文回填，**无需重建数据**（`database.py:_migrate_v2_to_v3`，幂等，中断后可重试）。
+
 ## 实现原则
 
 - **Search 只返回历史证据**，不回答问题、不调用生成式模型，也不把答案伪装成记忆。

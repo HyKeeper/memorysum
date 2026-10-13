@@ -45,11 +45,13 @@
 2. **纯 rerank 排序不可靠**：必须与检索排名融合，见 `SearchService._fuse_rankings`。`reranker.enabled=true` 时走这条路径，`fusion_weight` 默认 2.0（以共识为主、精排为辅）。
 3. **别指望"换个更强的小模型"单独解决问题**：`bge-reranker-v2-m3`（568M）单独排序净 +1 且不稳定。
 4. **配置项必须接线**：曾出现 `capacity.max_add_messages` 声明了、真实限制却硬编码在 `api/schemas.py` 的情况——改 config 静默无效。现在由 `test_wire_limits_track_pipeline_config` 守护。
-5. **空白压缩无效**：proxy token 规则本就不计空白，压缩不改变窗口切分，端到端 net 0。
+5. **Search 必须回传 `source_ids` 与时间锚点**：平台的 gold 定位优先读 item 上的 id（`source_ids` → `sourceIds` → `chunk_ids` → `ids` → …），只在兜底时解析正文里的 META 头；正文带头的窗口只占约 29%，所以把 id 落库并显式返回是机制性的 Recall 前提，别把它当成可选装饰。锚点必须原样返回（`Session 1 (…)`），**不能加 `Time:` 前缀**（平台会删掉该行）。
+6. **空白压缩无效**：proxy token 规则本就不计空白，压缩不改变窗口切分，端到端 net 0。
 6. **窗口粒度已经是最优**：leaf 512/ctx 640 或 leaf 256/ctx 320 都掉到 29/60。
 7. **`chinese_fts` 不是中文专用**：它走 jieba 分词，对英文同样产出词项（gold 召回 26/30、平均排名 4.2，优于 `english_fts`）；权重降到 0 反而掉到 32/60，所以必须保留小权重。
 8. **1024 维 MRL 截断不省显存**（只省存储与 KNN 时间），且 llama.cpp 不支持服务端截断（`dimensions` 参数被忽略，实测返回 2560 维）。
-9. **提高 embedding 吞吐没有配置空间**：并发 1→8、单请求批大小 1→64 的所有组合吞吐都封顶 ~21 windows/s，ubatch 2048→4096 无差异——瓶颈是 GPU 计算，不是显存/slot 数。
+9. **`PRAGMA user_version` 会加入未提交事务**：写 schema 迁移时，`ALTER TABLE` 是被隐式提交的，而 PRAGMA 的修改会随连接关闭被回滚——不显式 `commit()` 就导致"列加了但版本号没变"，每次打开都重复迁移、重复回填。见 `_migrate_v2_to_v3`。
+10. **提高 embedding 吞吐没有配置空间**：并发 1→8、单请求批大小 1→64 的所有组合吞吐都封顶 ~21 windows/s，ubatch 2048→4096 无差异——瓶颈是 GPU 计算，不是显存/slot 数。
 
 ## 本机环境的坑
 
