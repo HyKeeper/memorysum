@@ -19,6 +19,10 @@
 >
 > **schema v3 就地迁移**：老 scope 在首次打开时自动补上 `metadata_ids` / `metadata_anchor` 两列并从原文回填，**无需重建数据**（`database.py:_migrate_v2_to_v3`，幂等，中断后可重试）。
 
+> **检索质量怎么量（2026-10-13 建立）**：`scripts/eval_locomo.py` 用 LoCoMo 官方标注（`locomo10.json` 的 question / answer / evidence / category）对已灌入的 scope 打分，离线跑 SearchService，不影响线上服务。两个口径一起看：**`ids_all`**（返回项的 `source_ids` 覆盖 gold evidence 的比例，即平台的 Recall 口径）和 **`txt_all`**（gold turn 原文真的出现在返回正文里，决定 accuracy 上限）——两者之差就是 chunk 级 id 粒度掩盖的部分。`--budgets 0,4096,8192` 模拟平台按 token 截断：**条目更大和条目更多在预算内互斥**，`groups.direct_max_tokens` 从 640 降到 384 能让 4096 预算多塞 5 条记录（ids_all 86.7%→90.7%），但不截断时反而少给内容。改任何排序参数都要做 **split-half** 和 **跨对话交叉验证**（用 `locomo10.json` 按 `[LOCOMO_META chunk_id=… source_ids=…]` 格式自建 scope 灌入即可）。
+>
+> **本轮结论**：唯一经三折验证的改进是 `retrieval.per_source_cap = 1`（每个 chunk 最多返回 1 条，避免一个话多的 chunk 占满 top-k，给多跳题的第二处证据腾位置），三对话 ids_all +2.5 / 0 / +0.7pp，无负向。相似度分数加权、chunk 共识投票、说话人加权、邻居扩展、规则式多查询扩展均已实现但**默认关闭**——它们只在 80 题小样本上有效，全量或跨对话后回到噪声甚至转负；把 `context_dense` 权重上调到 2.0 属于典型的单对话过拟合（conv-26 +3.8pp，conv-30 −1.2pp），已回滚。
+
 ## 实现原则
 
 - **Search 只返回历史证据**，不回答问题、不调用生成式模型，也不把答案伪装成记忆。
