@@ -10,8 +10,8 @@ api/app.py
   ├── providers/protocols.py     # embedding/rerank 接口
   │     ├── providers/factory.py   # 按 champion-v1.json 的 provider 名选实现
   │     ├── providers/openrouter.py # 远程 embedding/rerank（OpenRouter wire format）
-  │     ├── providers/local_openai.py  # 本地 OpenAI 兼容 /v1/embeddings（llama.cpp 等）
-  │     └── providers/split.py     # 本地 embedding + 远程 rerank 的组合
+  │     ├── providers/local_openai.py  # 本地端点：OpenAI 兼容 embedding + cross-encoder rerank
+  │     └── providers/split.py     # embedding 与 rerank 分属不同供应商时的组合
   └── storage/database.py        # user_id 路由、SQLite 生命周期、sqlite-vec
 
 core/
@@ -26,7 +26,9 @@ core/
   └── cache.py                   # 有界进程内 TTL/LRU
 ```
 
-业务层不拼 OpenRouter URL，不直接生成回答；provider 层不访问 SQLite；存储层不知道 rerank 策略。新增实际供应商时，增加 `ModelProvider` 实现并在 `providers/factory.py` 中登记，不把供应商字段散落进 Add/Search 代码。embedding 与 rerank 可来自不同供应商：`provider: "local-openai"` 表示走 `MEMORYSUM_EMBEDDING_BASE_URL`（默认 `http://127.0.0.1:7999/v1`）的本地 OpenAI 兼容端点，此时 rerank 仍可由 OpenRouter 承担，两者由 `SplitProvider` 拼成单个 `ModelProvider`；参与 `embedding_space_id` 指纹的是 embedding 一边的端点地址。
+业务层不拼 OpenRouter URL，不直接生成回答；provider 层不访问 SQLite；存储层不知道 rerank 策略。新增实际供应商时，增加 `ModelProvider` 实现并在 `providers/factory.py` 中登记，不把供应商字段散落进 Add/Search 代码。embedding 与 rerank 可来自不同供应商：`provider: "local-openai"` 表示走本地端点（embedding 用 `MEMORYSUM_EMBEDDING_BASE_URL`，默认 `http://127.0.0.1:7999/v1`；cross-encoder rerank 用 `MEMORYSUM_RERANK_BASE_URL`，默认 `http://127.0.0.1:7997`，同时兼容 llama.cpp `--reranking` 的 `{"results":[{"index","relevance_score"}]}` 与自建 FastAPI 服务的裸数组 `[{"index","score"}]` 两种响应形状），两者由 `SplitProvider` 拼成单个 `ModelProvider`；参与 `embedding_space_id` 指纹的是 embedding 一边的端点地址。
+
+**精排不直接取代检索排序**：`SearchService._fuse_rankings` 把 rerank 排名与 RRF 排名再融合一次（`score = 1/(k + rerank_rank) + w/(k + retrieval_rank)`，`reranker.fusion_weight` 默认 2.0），以保留多通道共识信号——实测纯 rerank 排序在两个半样本上分别是 +4 与 -3，融合后为 +4 与 0（见 README 的实测记录）。
 
 ## Add 状态流
 
