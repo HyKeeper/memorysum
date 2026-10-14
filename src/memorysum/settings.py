@@ -73,6 +73,34 @@ class RetrievalModeConfig(FrozenConfig):
     output_tokens: int
 
 
+class QueryExpansionConfig(FrozenConfig):
+    """伪相关反馈（RM3 式）的查询扩展参数；机制见 `core/expansion.py`。
+
+    **不引入任何生成式模型**：只有词频、文档频次与现成的 embedding。
+    """
+
+    enabled: bool = False
+    #: 调用方要的结果少于这个数就不扩展：`top_k` 小说明只要少数结果，
+    #: 此时扩展带来的漂移风险大于收益。
+    min_top_k: int = 30
+    #: 二次检索的初始召回条数（用户的 N）。
+    recall: int = 100
+    #: 扩展词个数 m。
+    terms: int = 8
+    #: 扩展权重 α（向量插值的系数）。
+    weight: float = 0.4
+    #: 门控阈值：只取 rerank 分数在该分位之上的文档当伪相关集。
+    gate_percentile: int = 70
+    #: 伪相关集小于这个数就整体回退到原始查询。
+    min_related: int = 3
+    #: 二次检索最多引入多少条新候选（防止新结果反客为主）。
+    max_new: int = 40
+    #: 丢掉出现在超过这个比例窗口里的词（区分度为零）。
+    max_df_ratio: float = 0.35
+    #: >0 时启用漂移哨兵：扩展词与原始查询向量的平均余弦低于它则回退。
+    drift_guard: float = 0.0
+
+
 class RetrievalConfig(FrozenConfig):
     rrf_k: int
     #: Scale `rrf_k` to the candidate count instead of using a fixed value
@@ -193,6 +221,7 @@ class PipelineConfig(FrozenConfig):
     reranker: RerankerConfig
     chunking: ChunkingConfig
     retrieval: RetrievalConfig
+    query_expansion: QueryExpansionConfig = QueryExpansionConfig()
     groups: GroupConfig
     coverage: CoverageConfig
     capacity: CapacityConfig

@@ -51,10 +51,10 @@ def apply_override(data: dict, spec: str) -> None:
     node[keys[-1]] = value
 
 
-def run_eval() -> dict:
+def run_eval(top_k: int = 10) -> dict:
     started = datetime.now(UTC)
     proc = subprocess.run(
-        [".venv/bin/python", "scripts/eval_retrieval.py"],
+        [".venv/bin/python", "scripts/eval_retrieval.py", "--top-k", str(top_k)],
         capture_output=True,
         text=True,
         timeout=1800,
@@ -87,6 +87,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--set", action="append", default=[], metavar="a.b=value")
     parser.add_argument("--baseline", action="store_true", help="先测当前配置作对照")
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="传给 eval_retrieval 的 top_k。测查询扩展（PRF）必须用 100，因为它在 top_k<30 时不触发",
+    )
     args = parser.parse_args()
 
     import hashlib
@@ -98,7 +104,7 @@ def main() -> int:
 
     if args.baseline:
         print("[baseline] 当前配置", flush=True)
-        runs.append((f"baseline {baseline_sha}", run_eval()))
+        runs.append((f"baseline {baseline_sha}", run_eval(args.top_k)))
 
     try:
         for spec in args.set:
@@ -107,7 +113,7 @@ def main() -> int:
             write_config(data)
             sha = hashlib.sha256(CONFIG.read_bytes()).hexdigest()[:12]
             print(f"[sweep] {spec}  ({sha})", flush=True)
-            runs.append((f"{spec}  {sha}", run_eval()))
+            runs.append((f"{spec}  {sha}", run_eval(args.top_k)))
             write_config(origin)  # 每个变体之后都还原，避免叠加
     finally:
         # 无论正常结束、异常还是被 Ctrl-C/中断，都要把配置还原

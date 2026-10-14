@@ -229,6 +229,10 @@ def contains_verbatim(text: str, target: str, run: int = _VERBATIM_RUN) -> bool:
     return False
 
 
+#: 每次 Search 的 top_k；main() 会按 --top-k 覆盖它。
+TOP_K = 10
+
+
 def ids_hit(item, gold_ids: tuple[str, ...]) -> bool:
     """平台的 Recall 口径：条目上的 id 能否定位到 gold（AGENTS.md 第 9 条）。"""
     return bool(gold_ids) and bool(set(item.source_ids or ()) & set(gold_ids))
@@ -238,7 +242,7 @@ def evaluate(service, user_id: str, gold, dump: bool) -> tuple[list, list, list]
     ranks, id_ranks, latencies = [], [], []
     for query, gold_id, _marker in CASES:
         started = time.perf_counter()
-        response = service.search(SearchRequest(query=query, user_id=user_id, top_k=10))
+        response = service.search(SearchRequest(query=query, user_id=user_id, top_k=TOP_K))
         latencies.append(time.perf_counter() - started)
         target, gold_ids = gold.get(gold_id, ("", ()))
         rank = None
@@ -270,7 +274,16 @@ def main() -> None:
     parser.add_argument("--user-id", default=DEFAULT_USER)
     parser.add_argument("--dump-rank", action="store_true", help="打印每条查询的排名")
     parser.add_argument("--no-split-half", action="store_true", help="跳过 split-half")
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="每次 Search 的 top_k。平台用 100；本地默认 10 是为了让 top1/top3 指标聚焦头部。"
+        "注意：查询扩展（PRF）只在 top_k >= query_expansion.min_top_k 时才触发，测它要传 100",
+    )
     args = parser.parse_args()
+    global TOP_K
+    TOP_K = args.top_k
 
     pipeline = load_pipeline_config()
     reranker = pipeline.reranker

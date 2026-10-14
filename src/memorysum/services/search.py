@@ -25,6 +25,7 @@ from memorysum.core.errors import (
     StorageError,
 )
 from memorysum.core.evidence import purify
+from memorysum.core.expansion import blend_query_vector, expansion_weights
 from memorysum.core.identity import canonical_json, scope_id
 from memorysum.core.metadata import (
     attach_anchor,
@@ -118,6 +119,45 @@ def _word_re(name: str) -> re.Pattern[str]:
         cached = re.compile(rf"\b{re.escape(name)}\b")
         _WORD_CACHE[name] = cached
     return cached
+
+
+def _mean_cosine(base: Sequence[float], vectors: Sequence[Sequence[float]]) -> float:
+    """查询向量与一组扩展词向量的平均余弦（漂移哨兵用）。"""
+    if not vectors:
+        return 0.0
+    base_norm = sum(value * value for value in base) ** 0.5
+    if base_norm <= 0:
+        return 0.0
+    total = 0.0
+    used = 0
+    for vector in vectors:
+        other_norm = sum(value * value for value in vector) ** 0.5
+        if other_norm <= 0 or len(vector) != len(base):
+            continue
+        dot = sum(a * b for a, b in zip(base, vector, strict=False))
+        total += dot / (base_norm * other_norm)
+        used += 1
+    return total / used if used else 0.0
+
+
+def _merge_ranked(
+    base: Sequence[tuple[RerankEntry, float]],
+    extra: Sequence[tuple[RerankEntry, float]],
+) -> list[tuple[RerankEntry, float]]:
+    """把二次检索的排名并进原排名：按 view_id 去重，各自的分数保留，整体按分数降序。
+
+    两侧的分数来自**同一个 reranker 对同一个原始查询**的打分，所以可比；这也是
+    "扩展只补位、不顶替"的实现方式 —— 原有条目的分数不会被改写。
+    """
+    seen: set[str] = set()
+    merged: list[tuple[RerankEntry, float]] = []
+    for entry, score in list(base) + list(extra):
+        if entry.view_id in seen:
+            continue
+        seen.add(entry.view_id)
+        merged.append((entry, score))
+    merged.sort(key=lambda item: (-item[1], item[0].candidate.best_rank, item[0].view_id))
+    return merged
 
 
 def _primary_message_id(entry: RerankEntry) -> str:
@@ -361,6 +401,26 @@ class SearchService:
             return response
 
         ranked = self._rank_entries(entries, request.query, options, deadline)
+        # 伪相关反馈（可选）：拿本轮的高分候选当"伪相关集"学扩展词，二次检索后**并集**进来。
+        # 关键约束：新增候选也要用**原始查询**重排（见 `_prf_expand`），所以它只会"补位"，
+        # 不会把原来相似度高的条目前推后。整体用开关控制，默认关。
+        expansion = self._pipeline.query_expansion
+        if expansion.enabled and request.top_k >= expansion.min_top_k:
+            extra = self._prf_expand(
+                reference,
+                request.user_id,
+                snapshot,
+                query_vector,
+                request.query,
+                options,
+                wide_mode,
+                ranked,
+                request,
+                deadline,
+            )
+            if extra:
+                ranked = _merge_ranked(ranked, extra)
+                diagnostics["prf_added"] = len(extra)
         response = self._select_output(ranked, request.top_k, mode, question_cost, request.query)
         diagnostics["returned_records"] = len(response.data)
         diagnostics["returned_chars"] = sum(len(item.content) for item in response.data)
@@ -1039,6 +1099,120 @@ class SearchService:
             if len(selected) >= max_groups:
                 break
         return selected
+
+    def _prf_expand(
+        self,
+        reference: ScopeRef,
+        user_id: str,
+        snapshot: Snapshot,
+        query_vector: Sequence[float],
+        query: str,
+        options: Sequence[str],
+        wide_mode: bool,
+        ranked: Sequence[tuple[RerankEntry, float]],
+        request: SearchRequest,
+        deadline: float,
+    ) -> list[tuple[RerankEntry, float]]:
+        """伪相关反馈：从高分候选学扩展词 → 插值查询向量 → 二次检索 → 重排新候选。
+
+        纯统计，**不用任何生成式模型**。任一步不成立都返回空列表（调用方保持原排名不变）：
+        候选太少、学不出扩展词、二次检索没带来新窗口 —— **绝不返回更少的内容**。
+
+        漂移是这套方法唯一的真风险，所以扩展词会写进 diagnostics（调用方负责记录），
+        并且 `drift_guard > 0` 时先用查询向量与扩展词向量的平均余弦把一道关。
+        """
+        expansion = self._pipeline.query_expansion
+        if len(ranked) < expansion.min_related:
+            return []
+
+        # 1) 门控：只把 rerank 分数靠前的一部分当"伪相关集"
+        ordered_scores = sorted((score for _, score in ranked), reverse=True)
+        keep = max(
+            expansion.min_related,
+            round(len(ordered_scores) * (100 - expansion.gate_percentile) / 100),
+        )
+        theta = ordered_scores[min(keep, len(ordered_scores)) - 1]
+        related = [entry for entry, score in ranked if score >= theta]
+        if len(related) < expansion.min_related:
+            return []
+        related = related[: expansion.recall]
+
+        # 2) 扩展词：TF/(1+DF)。DF 走 FTS 索引，不扫库。
+        connection = self._database.connect(reference, user_id)
+        try:
+            with transaction(connection, "DEFERRED"):
+                total_windows = int(
+                    connection.execute(
+                        "SELECT count(*) FROM active_windows WHERE published_epoch<=?",
+                        (snapshot.epoch,),
+                    ).fetchone()[0]
+                )
+
+                def df_lookup(term: str) -> int:
+                    expression = safe_fts_expression([term])
+                    if not expression:
+                        return 0
+                    table = "fts_zh" if not term.isascii() else "fts_en"
+                    # epoch 在 active_windows 上，不在 FTS 表上 —— 与 _fts_hits 的 JOIN 保持一致
+                    row = connection.execute(
+                        f"""SELECT count(*) FROM {table} AS f
+                            JOIN active_windows AS a ON a.window_id=f.rowid
+                            WHERE {table} MATCH ? AND a.published_epoch<=?""",
+                        (expression, snapshot.epoch),
+                    ).fetchone()
+                    return int(row[0]) if row else 0
+
+                terms = expansion_weights(
+                    (entry.response_content for entry in related),
+                    query,
+                    df_lookup,
+                    limit=expansion.terms,
+                    max_df_ratio=expansion.max_df_ratio,
+                    total_windows=total_windows,
+                )
+        finally:
+            connection.close()
+        if not terms:
+            return []
+        term_texts = [term for term, _weight in terms]
+
+        # 3) 扩展查询向量：v' = normalize(v_q + α·mean(v_w))
+        instruction = self._pipeline.embedding.query_instruction
+        vectors = self._provider.embed([f"{instruction}\n\n{term}" for term in term_texts])
+        normalized, _ = normalize_batch(vectors, len(vectors))
+        if expansion.drift_guard > 0:
+            drift = _mean_cosine(query_vector, normalized)
+            if drift < expansion.drift_guard:
+                return []
+        expanded_vector = blend_query_vector(query_vector, normalized, expansion.weight)
+
+        # 4) 二次检索（FTS 侧用"原查询 + 扩展词"的文本，向量侧用插值后的向量）
+        expanded_text = query + " " + " ".join(term_texts)
+        channels, rows = self._retrieve_candidates(
+            reference, user_id, snapshot, expanded_vector, expanded_text, options, wide_mode
+        )
+        mode = self._pipeline.retrieval.wide if wide_mode else self._pipeline.retrieval.ordinary
+        fused = reciprocal_rank_fusion(
+            channels,
+            k=self._pipeline.retrieval.rrf_k,
+            limit=mode.candidate_cap,
+            similarity_weight=float(
+                getattr(self._pipeline.retrieval, "similarity_weight", 0.0) or 0.0
+            ),
+            channel_consensus_bonus=float(
+                getattr(self._pipeline.retrieval, "channel_consensus_bonus", 0.0) or 0.0
+            ),
+        )
+        fresh_entries = self._prepare_rerank_entries(fused, rows, request, options, wide_mode)
+        existing = {entry.view_id for entry, _score in ranked}
+        fresh = [entry for entry in (fresh_entries or []) if entry.view_id not in existing]
+        if not fresh:
+            return []
+        fresh = fresh[: expansion.max_new]
+        # 5) 用**原始查询**重排新候选：保证与原有分数同尺度、且评判标准不变
+        rerank_query = self._rerank_query(query, list(options) if options else None)
+        scores = self._rerank_entries(rerank_query, fresh, deadline)
+        return self._fuse_rankings(fresh, scores, query)
 
     def _rank_entries(
         self,

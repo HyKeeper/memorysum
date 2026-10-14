@@ -154,3 +154,39 @@ def test_time_anchor_scope_stays_declared_and_typed():
     assert groups.time_anchor_scope in {"temporal", "all"}
     with pytest.raises(ValidationError):
         GroupConfig(**{**groups.model_dump(), "time_anchor_scope": "everything"})
+
+
+def test_query_expansion_is_off_by_default_and_gated_by_top_k():
+    """查询扩展（PRF）是叠加层：**默认关闭**，且 `top_k < min_top_k` 时不触发。
+
+    它是在 74.90 那版之上加的，所以必须证明"关着的时候什么都没变"：
+    默认值关、阈值挡住小 top_k、以及两个新配置的默认值都不改变历史行为。
+    """
+    from memorysum.core.expansion import blend_query_vector, expansion_weights
+    from memorysum.settings import load_pipeline_config
+
+    config = load_pipeline_config()
+    assert config.query_expansion.enabled is False, "PRF 必须默认关闭"
+    assert config.query_expansion.min_top_k >= 30, "小 top_k 查询要关掉扩展（用户要求）"
+    assert config.retrieval.channel_consensus_bonus == 0.0, "共识奖励默认关"
+    assert config.retrieval.rrf_k == 20 and config.retrieval.rrf_k_adaptive is True
+
+    # 扩展词：排除已在 query 里的词，并按 TF/(1+DF) 排序
+    df_table = {t: 5 for t in ("quantum", "plutonium", "alignment", "capacitor")}
+    terms = expansion_weights(
+        ["the quantum flux capacitor needs a plutonium core", "plutonium core alignment"],
+        "what does the flux capacitor need",
+        lambda term: df_table.get(term, 0),  # 表外词 DF=0（真实实现走 FTS 索引）
+        limit=3,
+        total_windows=1000,
+    )
+    picked = [term for term, _ in terms]
+    assert "capacitor" not in picked and "flux" not in picked, "query 里已有的词不该重复加"
+    assert "plutonium" in picked
+
+    # 向量插值：alpha=0 时原样返回（关掉扩展的语义等价物）
+    base = [1.0, 0.0, 0.0]
+    assert blend_query_vector(base, [[0.0, 1.0, 0.0]], 0.0) == base
+    blended = blend_query_vector(base, [[0.0, 1.0, 0.0]], 0.4)
+    assert abs(sum(v * v for v in blended) - 1.0) < 1e-9, "插值后必须重新归一化"
+    assert blended[1] > 0, "扩展词的方向应当被混入"

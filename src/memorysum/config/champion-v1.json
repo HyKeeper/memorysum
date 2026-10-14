@@ -121,5 +121,17 @@
     "min_chars": 15,
     "max_state_chars": 1000,
     "timeout_seconds": 15.0
+  },
+  "query_expansion": {
+    "enabled": false,
+    "min_top_k": 30,
+    "recall": 100,
+    "terms": 8,
+    "weight": 0.4,
+    "gate_percentile": 70,
+    "min_related": 3,
+    "max_new": 40,
+    "max_df_ratio": 0.35,
+    "drift_guard": 0.0
   }
 }
