@@ -95,3 +95,34 @@ ids_all 对齐（39/60、0.745），不是质量下滑——详见第 32、33 �
 
 - 提交身份用仓库既有身份：`git -c user.name="HyKeeper" -c user.email="22790389+HyKeeper@users.noreply.github.com" commit ...`（本机没配 `user.name`/`user.email`，直接 commit 会报"作者身份未知"）。
 - 提交信息用英文祈使句标题 + 要点式正文，说明**改了什么、依据是什么**；实测结论要写进提交或 README。
+
+## 本地复现平台能力树评分（2026-10-14 建立）
+
+专家不给题集/金答案/评分标准，但我们可以自己闭环：**题面来自我们的 `/search` 日志，
+逐题判定来自平台回灌的 Add（`streaming-online-feedback-v1`，含 qa_id/question/
+predicted_answer/score/method），证据来自我们自己的检索**。
+
+每轮的固定四步（判据见下，必须跨轮一致，否则分数不可比）：
+
+```bash
+.venv/bin/python scripts/dump_question_evidence.py            # ① 题+证据 → /tmp/evidence_dump.md
+.venv/bin/python scripts/eval_mechanical_rules.py <requests>  # ② 机械规则先判（省人读）
+#  ③ 人/agent 读余下部分 → backups/<轮次>/local_verdicts*.jsonl（每题一行 {i,cap,v,blame,note}）
+.venv/bin/python scripts/eval_local_score.py <verdicts>       # ④ 聚合成同形状能力树
+.venv/bin/python scripts/eval_alignment.py <verdicts> backups/<轮次>/platform_tree.json --record
+```
+
+**严格判据**（宽松版「我能从证据读出答案」会给 81.71，严格版 68.29，平台真值 68.08）：
+
+1. 精确值题：答案必须**原样**出现在返回正文，且与 as-of 条件吻合；
+2. 时间题：只有 "yesterday / 半个月前" 而**无绝对锚点**可换算 → 0（官方 locomo1=0.0 印证）；
+3. 选择题：需**决定性**证据，仅"相关片段"→ 0.5；
+4. 不依赖记忆的题：按「平台模型能否答对」判（短建议题 1.0、长历史综合 0.0，用官方
+   E1=100 / F1=0 校准）。
+
+**别只看总分**：总分可能靠误差抵消凑巧对齐（本轮 +0.21 就是这么来的）。平台叶子分跨轮
+极稳（两次跑分 20 个叶子里 18 个完全相同），所以 **逐叶子偏差**才是收敛指标——
+`eval_alignment.py --record` 会把偏差写进 `backups/platform_alignment.json`，下一轮用
+「本地叶子 + 历史偏差」预测平台值并看残差。已知误差源：①题→子能力的映射是推断的
+（B1/C1 偏差最大，疑似错位）；②平台有 5 个子能力（C3/D2/E2/G2/I1）在 41 条 `/search`
+里没有实例（I1=46.43≈13/28，按 step 计分）。
