@@ -1252,7 +1252,10 @@ class SearchService:
             # text such as "Session 1 (1:56 pm on 8 May, 2023)" — never a
             # "Time: " prefix, which the platform strips from the response text.
             content = attach_anchor(entry.response_content, entry.anchor)
-            if self._pipeline.groups.time_anchor_in_text and is_temporal_query(query):
+            anchor_scope = self._pipeline.groups.time_anchor_scope
+            if self._pipeline.groups.time_anchor_in_text and (
+                anchor_scope == "all" or is_temporal_query(query)
+            ):
                 anchor_line = time_anchor_line(
                     timestamp_ms=entry.created_at_ms,
                     session=entry.session,

@@ -178,7 +178,9 @@ def test_add_is_synchronous_idempotent_and_user_isolated(tmp_path):
 
 def test_small_scope_narrow_search_returns_ranked_clean_items_and_obeys_top_k(tmp_path):
     provider = FruitProvider()
-    app = make_app(tmp_path / "data", provider)
+    # 显式关闭时间锚点：这个测试关心的是"窄搜索的干净条目 + top_k 契约 + 字段类型"，
+    # 锚点（另一维度的实验，见 test_time_anchor_*）会多一个渲染前缀行，只剩精确集合断言会碎。
+    app = make_app(tmp_path / "data", provider, groups_overrides={"time_anchor_in_text": False})
     source_messages = [
         "raw memory text",
         "I love apple",
@@ -647,7 +649,10 @@ def test_time_anchor_is_added_only_for_temporal_questions_and_only_when_enabled(
 
     off = search(
         make_app(
-            tmp_path / "a", FakeProvider(), groups_overrides={"time_anchor_in_text": False}
+            tmp_path / "a",
+            FakeProvider(),
+            # scope 显式给定：这个测试校验的是“时间题/非时间题”的差异，不依赖打包配置的当前值
+            groups_overrides={"time_anchor_in_text": False, "time_anchor_scope": "temporal"},
         ),
         "When did Caroline go?",
     )
@@ -655,14 +660,82 @@ def test_time_anchor_is_added_only_for_temporal_questions_and_only_when_enabled(
     assert off.startswith("[locomo_refined]")
 
     on_app = make_app(
-        tmp_path / "b", FakeProvider(), groups_overrides={"time_anchor_in_text": True}
+        tmp_path / "b",
+        FakeProvider(),
+        groups_overrides={"time_anchor_in_text": True, "time_anchor_scope": "temporal"},
     )
     on = search(on_app, "When did Caroline go?")
     assert on.startswith("Session 3 (26 Jan, 2024)"), on
     assert "D3:7" in on, "原文切片必须保留"
 
     non_temporal = search(
-        make_app(tmp_path / "c", FakeProvider(), groups_overrides={"time_anchor_in_text": True}),
+        make_app(
+            tmp_path / "c",
+            FakeProvider(),
+            groups_overrides={"time_anchor_in_text": True, "time_anchor_scope": "temporal"},
+        ),
         "What does Caroline prefer to drink?",
     )
     assert "26 Jan, 2024" not in non_temporal, "非时间类问题不该被加锚点"
+
+
+def test_time_anchor_scope_all_covers_non_temporal_questions(tmp_path):
+    """`time_anchor_scope="all"` 时非时间题也加锚点——覆盖面实验的接线证明。
+
+    动机：平台的 C1/C2/I1 三片叶子全是时间/顺序类，而 41 条可观测 query 只覆盖其中 7 条，
+    实例集在观测之外。词表再怎么扩都依赖猜测，而全量覆盖不依赖。另外要证明：
+    ① 正文切片逐字不变（锚点只是前缀）；② 没有 session 号时不留空壳。
+    """
+    payload = {
+        "request_id": "add-anchor-all",
+        "user_id": "anchor-all-user",
+        "session_id": "session-1",
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": 1706227200000,  # 2024-01-26T00:00:00Z
+                "content": "[locomo_refined][session_3][D3:7][text] Caroline: I went yesterday. I prefer tea.",
+            }
+        ],
+    }
+
+    def search(app, query):
+        with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+            assert client.post("/add", json=payload).status_code == 200
+            body = client.post(
+                "/search", json={"query": query, "user_id": "anchor-all-user", "top_k": 3}
+            ).json()
+        return " ".join(body["data"][0]["content"].split())
+
+    overrides = {"time_anchor_in_text": True, "time_anchor_scope": "all"}
+    non_temporal = search(
+        make_app(tmp_path / "a", FakeProvider(), groups_overrides=overrides),
+        "What does Caroline prefer to drink?",
+    )
+    assert non_temporal.startswith("Session 3 (26 Jan, 2024)"), non_temporal
+    assert "I prefer tea." in non_temporal, "正文切片必须逐字保留"
+
+    # 没有方括号簇头 → 没有 session 号 → 只留日期部分，不出现 "Session (…)" 空壳
+    headerless = {
+        **payload,
+        "request_id": "add-anchor-all-2",
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": 1706227200000,
+                "content": "Gina: Sorry about your job Jon, but starting your own business sounds awesome!",
+            }
+        ],
+    }
+    with TestClient(
+        make_app(tmp_path / "b", FakeProvider(), groups_overrides=overrides),
+        headers={"Authorization": "Bearer test-secret"},
+    ) as client:
+        assert client.post("/add", json=headerless).status_code == 200
+        body = client.post(
+            "/search",
+            json={"query": "How did Gina react?", "user_id": "anchor-all-user", "top_k": 3},
+        ).json()
+    line = body["data"][0]["content"].splitlines()[0]
+    assert line == "(26 Jan, 2024)", line
+    assert "Session" not in line, "没有 session 号时不该留空壳"

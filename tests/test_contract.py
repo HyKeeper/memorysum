@@ -108,3 +108,26 @@ def test_pipeline_config_has_no_unread_fields():
     assert "unused_quota_transfer" not in dumped["retrieval"]
     assert "sparse_channel" not in dumped["retrieval"]
     assert "reader_estimator" not in dumped["coverage"]
+
+
+def test_time_anchor_scope_stays_declared_and_typed():
+    """锚点覆盖面是平台叶子（C1/C2/I1）的开关，必须是显式配置且非法值报错。
+
+    背景：这三片叶子在 41 条可观测 query 里只覆盖到 7 条，所以“覆盖面”本身是一个
+    实验变量。若有人把这个键从 config 里删掉，行为会静默回到默认 `temporal` —— 等于
+    无声地撤销实验。所以要同时守护“显式声明”与“非法值报错”（而不是静默降级）。
+    """
+    import json
+    from importlib.resources import files
+
+    from memorysum.settings import GroupConfig, load_pipeline_config
+
+    payload = json.loads(
+        files("memorysum").joinpath("config/champion-v1.json").read_text(encoding="utf-8")
+    )
+    assert "time_anchor_scope" in payload["groups"], "锚点覆盖面必须在 config 里显式声明"
+
+    groups = load_pipeline_config().groups
+    assert groups.time_anchor_scope in {"temporal", "all"}
+    with pytest.raises(ValidationError):
+        GroupConfig(**{**groups.model_dump(), "time_anchor_scope": "everything"})
