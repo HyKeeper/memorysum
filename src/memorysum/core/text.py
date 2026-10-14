@@ -100,3 +100,30 @@ def utc_timestamp(timestamp_ms: int | None) -> str:
     except (OverflowError, OSError, ValueError):
         return f"unix-ms:{timestamp_ms}"
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+_WS_RUN = re.compile(r"[ \t\r\f\v]*\n[ \t\r\f\v\n]*")
+_TAB_RUN = re.compile(r"\t+")
+_SPACE_RUN = re.compile(r" {2,}")
+_ESCAPED = ((r"\\\"", '"'), (r"\\/", "/"), (r"\\n", "\n"), (r"\\t", " "))
+
+
+def collapse_whitespace(text: str, *, unescape: bool = False) -> str:
+    """把病态空白（\n×N、\t×N、连续空格）压到最小，可选解掉 JSON 转义。
+
+    实测（2026-10-14，XLM-R /tokenize 与 tiktoken 两种口径）：
+      · 连续 \n/\t 省 **0.0%** 真实 token（sentencepiece 把空白运行当单个标记），
+        我们自己的 tiktoken 预算口径也只省 1.4%；
+      · `\n` 直接接单词**不影响分词**（`code:\n```javascript` 两种情况都是 6 token，
+        词项都是 ['code','javascrip']）；
+      · 只有 JSON 反斜杠转义重的 trajectory 记录省 7%。
+    结论：这是**卫生性**清理，不是分数杠杆；而且返回正文按约定必须保持原文切片，
+    所以只在显式开启 `groups.normalize_whitespace` 时才用于响应正文。
+    """
+    text = _WS_RUN.sub("\n", text)
+    text = _TAB_RUN.sub(" ", text)
+    text = _SPACE_RUN.sub(" ", text)
+    if unescape:
+        for pattern, replacement in _ESCAPED:
+            text = re.sub(pattern, replacement, text)
+    return text

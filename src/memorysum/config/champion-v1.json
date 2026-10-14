@@ -82,7 +82,8 @@
     "direct_max_tokens": 384,
     "context_max_tokens": 1536,
     "head_records": 0,
-    "tail_cut_chars": 0
+    "tail_cut_chars": 0,
+    "normalize_whitespace": false
   },
   "coverage": {
     "always_full_tokens": 4096,

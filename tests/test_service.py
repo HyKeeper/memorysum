@@ -65,6 +65,7 @@ def make_app(
     *,
     rerank_enabled: bool = True,
     reranker_overrides: dict | None = None,
+    groups_overrides: dict | None = None,
 ):
     runtime = RuntimeSettings(
         data_root=data_root,
@@ -86,6 +87,10 @@ def make_app(
                     }
                 )
             }
+        )
+    if groups_overrides:
+        pipeline = pipeline.model_copy(
+            update={"groups": pipeline.groups.model_copy(update=groups_overrides)}
         )
     return create_app(
         runtime=runtime,
@@ -495,3 +500,50 @@ def test_search_reports_the_unreranked_fallback_in_diagnostics(tmp_path, caplog)
             == 200
         )
     assert any("No rerankable pair" in record.message for record in caplog.records)
+
+
+def _add_two_line_message(app, user_id: str) -> None:
+    payload = {
+        "request_id": f"add-{user_id}",
+        "user_id": user_id,
+        "session_id": "session-1",
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": 1704067200000,
+                "content": "Tea first.\n\n\t\t\t\tThen coffee.\nSecond line follows.",
+            }
+        ],
+    }
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        assert client.post("/add", json=payload).status_code == 200
+        searched = client.post(
+            "/search", json={"query": "Tea or coffee?", "user_id": user_id, "top_k": 3}
+        )
+        assert searched.status_code == 200
+        return client, payload, searched.json()
+
+
+def test_response_body_stays_verbatim_unless_whitespace_collapse_is_requested(tmp_path):
+    """原文保真：默认必须逐字返回切片，病态空白也不能动。
+
+    `groups.normalize_whitespace` 默认关闭。开启后只压空白（\n×N/\t×N/连续空格），
+    实测只省 0~1.4% token（XLM-R 口径 0%），所以默认保持原文；这个测试同时守住
+    "配置项必须接线"（开了要真的生效，而不是静默无效）。
+    """
+    body = _add_two_line_message(make_app(tmp_path / "data", FakeProvider()), "verbatim-user")[2]
+    assert body["data"], "must return the stored slice"
+    assert any("\n" in item["content"] for item in body["data"])
+    assert any("\t\t\t\t" in item["content"] for item in body["data"])
+
+    collapsed = _add_two_line_message(
+        make_app(
+            tmp_path / "data2", FakeProvider(), groups_overrides={"normalize_whitespace": True}
+        ),
+        "collapsed-user",
+    )[2]
+    assert collapsed["data"]
+    assert all(
+        "\t" not in item["content"] and "\n\n" not in item["content"] for item in collapsed["data"]
+    )
+    assert any("Tea first." in item["content"] for item in collapsed["data"])

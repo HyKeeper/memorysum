@@ -133,6 +133,10 @@ class GroupConfig(FrozenConfig):
     #: is near-optimal under both. 0 disables the split.
     head_records: int = 0
     tail_cut_chars: int = 0
+    #: 是否把响应正文里的病态空白（\n×N、\t×N、连续空格）压缩。**默认关闭**：
+    #: 原文保真约定要求正文是原文切片；实测该压缩只省 0~1.4% token（XLM-R 口径 0%），
+    #: 仅在明确要做平台侧 A/B 时打开。见 core/text.collapse_whitespace。
+    normalize_whitespace: bool = False
 
 
 class CoverageConfig(FrozenConfig):

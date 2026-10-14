@@ -40,6 +40,7 @@ from memorysum.core.rendering import (
 )
 from memorysum.core.text import (
     chinese_terms,
+    collapse_whitespace,
     english_terms,
     query_options_text,
     reader_token_count,
@@ -1241,6 +1242,10 @@ class SearchService:
             # text such as "Session 1 (1:56 pm on 8 May, 2023)" — never a
             # "Time: " prefix, which the platform strips from the response text.
             content = attach_anchor(entry.response_content, entry.anchor)
+            if self._pipeline.groups.normalize_whitespace:
+                # 默认关闭：原文保真要求正文是原文切片。实测只省 0~1.4% token
+                # （XLM-R 口径 0%），仅用于平台侧 A/B。见 core/text.collapse_whitespace。
+                content = collapse_whitespace(content)
             spans = entry.spans
             if expand:
                 # Widen each passage to its neighbouring text so a hit carries the

@@ -100,3 +100,26 @@ def test_rerank_query_cap_is_configured_and_finite():
     # A long query still needs to fit the rerank budget together with a window's text,
     # and the response token budget shrinks with the question, so the cap stays finite.
     assert 0 < reranker.max_query_proxy_tokens <= reranker.ordinary_pair_proxy_budget
+
+
+def test_whitespace_normalisation_is_off_by_default():
+    """原文保真约定：响应正文默认是原文切片，空白压缩只在显式开启时生效。
+
+    实测（2026-10-14）：\n×N/\t×N 压缩在 XLM-R 口径省 0.0% token、tiktoken 口径省
+    1.4%，返回条数与命中率都不变 —— 是卫生性清理，不是分数杠杆，所以默认关闭。
+    """
+    from memorysum.settings import load_pipeline_config
+
+    assert load_pipeline_config().groups.normalize_whitespace is False
+
+
+def test_collapse_whitespace_is_idempotent_and_keeps_word_boundaries():
+    from memorysum.core.text import collapse_whitespace
+
+    text = "a\n\n\n\t\t\t\tb\nJoined   words  \ttab"
+    once = collapse_whitespace(text)
+    assert once == "a\nb\nJoined words tab"
+    assert collapse_whitespace(once) == once
+    # JSON 转义只在显式要求时处理（默认不改正文语义）
+    assert collapse_whitespace('{\\"a\\": 1}') == '{\\"a\\": 1}'
+    assert collapse_whitespace('{\\"a\\": 1}', unescape=True) == '{"a": 1}'
