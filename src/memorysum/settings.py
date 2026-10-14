@@ -185,6 +185,10 @@ class GroupConfig(FrozenConfig):
     #: 正文里没有"看得见"的绝对时间时，是否按平台保留的锚点形态补一行
     #: `Session 1 (17 Jan, 2024)`（默认关闭；`Time:` 前缀会被平台删掉，所以不用那种）。
     time_anchor_in_text: bool = False
+    #: 时间/顺序类问题是否把返回里已有的会话锚点排成时间线，前置到响应最前面
+    #: （qa_ab.py 的 C 方案，`Conversation timeline: Session N = <date>`）。
+    #: **默认关闭**；只重排已有锚点、不新增事实，靶子是 C1/C2/I1 的顺序题。
+    timeline_in_text: bool = False
     #: 锚点的适用范围：`temporal` 只给时间/顺序类问题（默认），`all` 给所有问题。
     #: 平台侧吃锚点的叶子（C1/C2/I1）全是时间/顺序类，而 41 条可观测 query 只覆盖其中
     #: 7 条 —— 实例集在观测之外，扩大覆盖面是唯一不依赖猜测的做法。非时间题多一行

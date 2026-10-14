@@ -81,14 +81,15 @@
   },
   "groups": {
     "max_spans": 4,
-    "direct_max_tokens": 640,
+    "direct_max_tokens": 896,
     "context_max_tokens": 1536,
     "head_records": 0,
     "tail_cut_chars": 0,
     "normalize_whitespace": false,
     "time_anchor_in_text": true,
     "time_anchor_scope": "temporal",
-    "time_anchor_template": "Session {session} ({date})"
+    "time_anchor_template": "Session {session} ({date})",
+    "timeline_in_text": true
   },
   "coverage": {
     "always_full_tokens": 4096,

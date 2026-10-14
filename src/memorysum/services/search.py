@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
+from datetime import datetime
 
 from memorysum.api.schemas import SearchItem, SearchRequest, SearchResponse
 from memorysum.core.cache import TTLCache
@@ -140,6 +141,39 @@ def _mean_cosine(base: Sequence[float], vectors: Sequence[Sequence[float]]) -> f
     return total / used if used else 0.0
 
 
+#: 响应正文里的日期锚点：我们补的 `(20 Jan, 2023)` 与平台原生的
+#: `(1:56 pm on 8 May, 2023)` 都收集。locomo 窗口大多没有 `[session_N]` 簇头，
+#: 所以 timeline 以**日期**（可解析、可排序）为单位，不以 session 号为单位。
+_TIMELINE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\((\d{1,2} [A-Z][a-z]{2}, \d{4})\)"), "%d %b, %Y"),
+    (re.compile(r"\((\d{1,2}:\d{2} (?:am|pm) on \d{1,2} [A-Z][a-z]{2}, \d{4})\)"), "%I:%M %p on %d %b, %Y"),
+)
+
+
+def _timeline_block(items: Sequence[SearchItem]) -> str:
+    """把返回里已有的日期锚点排成时间线（qa_ab.py 的 C 方案）。
+
+    Locomo/temporal 题常问“某会话里的事相对另一会话多久”，而锚点分散在各条记录里；
+    把已有锚点解析、排序、前置到响应最前面，让模型一眼拿到顺序。
+    **不新增任何事实**（只重排已交付的日期文本），不足两个不同日期时返回空串。
+    """
+    seen: dict[str, datetime] = {}
+    for item in items:
+        for pattern, fmt in _TIMELINE_PATTERNS:
+            for match in pattern.finditer(item.content):
+                text = match.group(1)
+                if text in seen:
+                    continue
+                try:
+                    seen[text] = datetime.strptime(text.replace("  ", " "), fmt)
+                except ValueError:
+                    continue
+    if len(seen) < 2:
+        return ""
+    ordered = sorted(seen, key=lambda text: (seen[text], text))
+    return "Conversation timeline:\n" + "\n".join(f"  {text}" for text in ordered) + "\n"
+
+
 def _merge_ranked(
     base: Sequence[tuple[RerankEntry, float]],
     extra: Sequence[tuple[RerankEntry, float]],
@@ -158,7 +192,7 @@ def _merge_ranked(
     if policy == "append":
         seen: set[str] = set()
         tail: list[tuple[RerankEntry, float]] = []
-        for entry, score in base:
+        for entry, _score in base:
             seen.add(entry.view_id)
         for entry, score in extra:
             if entry.view_id in seen:
@@ -1539,6 +1573,17 @@ class SearchService:
             source_counts[source_key] += 1
             for span in spans:
                 covered.setdefault(str(span["source_id"]), []).append(bounds(span))
+        if (
+            selected
+            and self._pipeline.groups.timeline_in_text
+            and self._pipeline.groups.time_anchor_in_text
+            and is_temporal_query(query)
+        ):
+            # 时间题：把已交付的会话锚点排成时间线前置到头部（不新增事实）。
+            timeline = _timeline_block(selected)
+            if timeline:
+                head = selected[0]
+                selected[0] = head.model_copy(update={"content": f"{timeline}\n{head.content}"})
         return SearchResponse(data=selected)
 
     def _rerank_query(self, query: str, options: Sequence[str]) -> str:
