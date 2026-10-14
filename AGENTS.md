@@ -61,6 +61,11 @@
 22. **两段式输出（前 N 条全量 + 尾部裁剪）在截断口径下最强但差异太大**：`head_records=3 + tail_cut_chars=800` 在 4096 预算下 ids_all 92.7%（比 baseline 高 6pp），但不截断口径下 txt_all 只有 78.7%（比 baseline 低 16.6pp）——两头不讨好，默认关闭。
 23. **`per_source_cap=1`（每个 chunk 最多返回 1 条）是本轮唯一经跨对话验证的改进**：conv-26 +2.5pp、conv-30 0、conv-41 +0.7pp（ids_all），无负向。机理是避免一个话多的 chunk 占满 top-k，让多跳题的第二处证据有位置。
 
+24. **决策模型（Jev / THX-01）做不了我们的 reranker**：这类模型（TypeSafe Jev 闭源、THX-01 开源 322M，Apache 2.0）是"选项 token 上一次前向出校准概率"，不做生成。THX-01 实测 CPU 上 85ms/决策、不需 GPU（想上卡反而因 PyTorch 上下文 1.37GB 而 OOM），但：当 reranker 系统性弱于 bge+RRF（top-1 命中 15-20 vs 22，三组参数复现、独占≈0）；问题类型分类 22.4%（88% 的 multi-hop 被判成 open_domain）；`excerpt` 切答案 17%（原窗口本身 36%）。**决定性限制是输入上限 1024 token**（question+options+state 全算），我们一条窗口就 256-320 token —— 它无法"一次看很多候选"，所以永远做不了全局重排，只能逐条判。
+25. **它唯一可用的能力是 `cite`（定位证据句）**：返回逐字片段 + 字符偏移 + 概率，概率是有效质量信号（>0.9 基本对，<0.3 基本噪声），人工核对 15 题里 10 题完美或相关。已集成成 `evidence_purify`（默认关，见 `core/evidence.py`），机制是给前 N 条记录加 `[Key evidence: …]` 前缀、原文完整保留。**六层失败即原样返回**，其中最关键的一层是"引用必须能在该条原文里逐字找到"——它让幻觉 span 无法进入响应。实测（LoCoMo 4 对话 320 题）：答题准确率 26.9% → 27.8%，+3 题（赢 7 输 4），**McNemar p=0.549 不显著**，收益全部来自 temporal 类。**注意：改 config 打开它必须重启服务才生效**（进程内没有调用代码时改配置无用）。
+26. **LLM judge 的噪声是系统性的，不是随机的**：同一输入重复判 5 次结果稳定，但语义相同的不同表述会判出相反结论（gold=`Oliver, Luna, Bailey` 时 `Luna and Oliver` 判对而 `Oliver and Luna` 判错）——**投票治不了**。必须"规则优先 + LLM 兜底"：gold 是列表就要求元素全中、含数字就要求数字全中并做数字词映射（four→4、twice→2）、明确说不知道直接判错，其余才交给 LLM。规则命中率 85% 时判定才稳定。**代价是绝对数字大降**：同一批题从宽松 LLM judge 的 62.5% 掉到真实的 26.9%，旧的虚高数字不能用来汇报。参考实现见 `/home/rain/bench/judge_v2.py`。
+27. **统计功效**：40 题的 A/B 只能检测 >8% 的效应，"赢 2 输 2"无法区分有无；**+2% 需要约 1500 题**，+5% 需要约 300 题。配对设计看的是"赢/输比例是否显著偏离 1:1"（McNemar），不是净值 —— 即使拿到"赢 10 输 8"也不显著（p≈0.81）。
+
 ## 本机环境的坑
 
 - **GitHub push 间歇性完全不通**：单次命令常失败（`GnuTLS recv error (-110)` 或 135 s 连接超时）。必须写成**重试循环**（实测第 4-6 次才通，成功时仅 2-4 秒）。`git ls-remote`（只读）通常 1 秒成功，可用它区分"网络不通"与"认证失败"。
@@ -72,6 +77,10 @@
 - 数据目录 `data/`、`logs/`、`keys.txt`、`.env` 都在 `.gitignore` 里；`keys.txt` 每行一个裸 Bearer token。
 
 ## 提交约定
+
+> **`ps | grep` 会匹配到自己的 shell（今天踩了 4 次）**：在 bash 里写 `ps -eo pid,args | grep -i firefox` 或 `pgrep -f 'qa_ab'` 再 kill 结果时，**当前 shell 的命令行本身含那个模式串**，于是匹配到自己并自杀（表现为 exit 137/143、命令无输出、后续逻辑不执行）。安全做法：① 优先用**已知 PID** 直接 kill；② 按名字查找用 `pgrep -x <精确进程名>`（只匹配 comm）；③ 或遍历 `/proc/*/comm`；④ 必须在命令行里放模式串时，拆开写（`P="qa""_ab"`）并排除 `$$`。`pkill -f '<pattern>'` 同理。
+
+
 
 - 提交身份用仓库既有身份：`git -c user.name="HyKeeper" -c user.email="22790389+HyKeeper@users.noreply.github.com" commit ...`（本机没配 `user.name`/`user.email`，直接 commit 会报"作者身份未知"）。
 - 提交信息用英文祈使句标题 + 要点式正文，说明**改了什么、依据是什么**；实测结论要写进提交或 README。
