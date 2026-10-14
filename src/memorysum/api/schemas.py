@@ -23,7 +23,11 @@ _CAPACITY = load_pipeline_config().capacity
 
 
 class StrictRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    # `extra="ignore"`，不是 `forbid`：平台文档说它只读声明的字段，而**我们**对入参也要宽容 ——
+    # 实测（2026-10-14）平台会带未声明字段（`session_id`/`filters`/`metadata`/`request_id` …）来调
+    # `/search`，`forbid` 会直接 422，而文档明确规定 422 "不自动重试" 且"当前阶段立即失败"。
+    # 全天日志里有 **163 次** 422，全部是 `extra_forbidden`。忽略未知字段不会改变语义。
+    model_config = ConfigDict(extra="ignore", strict=True)
 
 
 class AddMessage(StrictRequest):

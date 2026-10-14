@@ -50,12 +50,35 @@ def test_add_echo_fields_are_not_normalized():
         {"timestamp": 1.5},
         {"content": "   "},
         {"content": "bad\x00content"},
-        {"extra": "not allowed"},
     ],
 )
 def test_add_rejects_invalid_or_unknown_fields(overrides):
     with pytest.raises(ValidationError):
         AddRequest.model_validate(add_payload(**overrides))
+
+
+def test_unknown_top_level_fields_are_ignored_not_rejected():
+    """未声明的入参字段要**忽略**，不能 422。
+
+    2026-10-14 实测：平台会带 `session_id` / `filters` / `metadata` / `request_id` 来调 `/search`，
+    而旧行为（`extra="forbid"`）把它们变成 422；平台文档写明 422 **不重试**且"当前阶段立即失败"，
+    日志里全天累计 163 次。宽容处理不改变语义（我们只读声明的字段），但不会让平台阶段失败。
+    """
+    extra = {
+        "session_id": "s1",
+        "filters": {"a": 1},
+        "metadata": {"b": 2},
+        "request_id": "r1",
+        "keyword_search": True,
+        "rerank": False,
+    }
+    request = SearchRequest.model_validate({"query": "hello", "user_id": "u1", "top_k": 5, **extra})
+    assert request.query == "hello" and request.top_k == 5
+    add = AddRequest.model_validate({**add_payload(), **extra})
+    assert add.messages[0].content == "I prefer tea."
+    # 声明过的字段仍然严格：类型不对照样拒绝
+    with pytest.raises(ValidationError):
+        SearchRequest.model_validate({"query": "hello", "user_id": "u1", "top_k": "5"})
 
 
 def test_search_strictly_validates_top_k_and_options():
