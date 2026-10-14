@@ -99,6 +99,11 @@ class QueryExpansionConfig(FrozenConfig):
     max_df_ratio: float = 0.35
     #: >0 时启用漂移哨兵：扩展词与原始查询向量的平均余弦低于它则回退。
     drift_guard: float = 0.0
+    #: 新候选的插入策略：`score` = 与原有候选同池按分数排序（可能顶替原排名）；
+    #: `append` = 新候选只追加在原排名之后（严格保证原排序不被改写，只在 top_k
+    #: 与 token 预算允许时多交几条证据）。用户设计意图“扩出的新答案不应顶替
+    #: 高相似度答案”对应 `append`；实测 `score` 会掉 top-1（见 sweep 台账）。
+    merge_policy: str = "score"
 
 
 class RetrievalConfig(FrozenConfig):
@@ -192,6 +197,13 @@ class CoverageConfig(FrozenConfig):
     always_full_tokens: int
     conditional_full_tokens: int
     conditional_full_requires_wide_or_context_mode: bool
+    #: 小于 `always_full_tokens` 的 scope 是否也对**普通查询**开放全量交付。
+    #: 默认 False = 保持历史行为（只对 wide/context 查询开放）。设为 True 的实验假设：
+    #: 小 scope 的全部内容都放得下（≤4096 token），而窗口切分会把“昨天 → 02 Jan”
+    #: 这类跨窗上下文切碎——locomo 时间题恰好都是小 scope（29~700 条短消息）。
+    #: 语料消息长（>窗口）时不开，因为整条消息会稀释 rerank 信号（实测 full_bundle
+    #: 对长消息曾把 gold 从第 1 名砸到第 19 名）。
+    always_full_for_all_queries: bool = False
     safe_input_tokens: int
     estimation_safety_factor: float
     platform_instruction_reserve: int

@@ -33,31 +33,35 @@ def read_config() -> dict:
     return json.loads(CONFIG.read_text(encoding="utf-8"))
 
 
-def write_config(data: dict) -> None:
-    CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
 def apply_override(data: dict, spec: str) -> None:
-    """`a.b.c=value` —— 值按 JSON 解析（数字/布尔/null/数组），失败就当字符串。"""
-    path, _, raw = spec.partition("=")
-    keys = path.split(".")
-    node = data
-    for key in keys[:-1]:
-        node = node[key]
-    try:
-        value = json.loads(raw)
-    except ValueError:
-        value = raw
-    node[keys[-1]] = value
+    """`a.b.c=value` —— 值按 JSON 解析（数字/布尔/null/数组），失败就当字符串。
+
+    用 `;` 分隔可以一次改多个键（组合实验，如
+    `query_expansion.enabled=true;query_expansion.terms=5`）。
+    """
+    for part in spec.split(";"):
+        path, _, raw = part.partition("=")
+        keys = path.split(".")
+        node = data
+        for key in keys[:-1]:
+            node = node[key]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        node[keys[-1]] = value
 
 
-def run_eval(top_k: int = 10) -> dict:
+def run_eval(top_k: int = 10, config_path: str | None = None) -> dict:
     started = datetime.now(UTC)
+    command = [".venv/bin/python", "scripts/eval_retrieval.py", "--top-k", str(top_k)]
+    if config_path:
+        command += ["--config", config_path]
     proc = subprocess.run(
-        [".venv/bin/python", "scripts/eval_retrieval.py", "--top-k", str(top_k)],
+        command,
         capture_output=True,
         text=True,
-        timeout=1800,
+        timeout=3600,
     )
     text = proc.stdout + proc.stderr
     result: dict[str, object] = {"seconds": (datetime.now(UTC) - started).total_seconds()}
@@ -110,16 +114,15 @@ def main() -> int:
         for spec in args.set:
             data = json.loads(json.dumps(origin))  # deep copy
             apply_override(data, spec)
-            write_config(data)
-            sha = hashlib.sha256(CONFIG.read_bytes()).hexdigest()[:12]
-            print(f"[sweep] {spec}  ({sha})", flush=True)
-            runs.append((f"{spec}  {sha}", run_eval(args.top_k)))
-            write_config(origin)  # 每个变体之后都还原，避免叠加
+            body = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+            sha = hashlib.sha256(body.encode()).hexdigest()[:12]
+            tmp = Path(f"/tmp/memorysum-sweep-{sha}.json")
+            tmp.write_text(body, encoding="utf-8")
+            print(f"[sweep] {spec}  ({sha})  -> {tmp}", flush=True)
+            runs.append((f"{spec}  {sha}", run_eval(args.top_k, str(tmp))))
     finally:
-        # 无论正常结束、异常还是被 Ctrl-C/中断，都要把配置还原
-        write_config(origin)
-        sha = hashlib.sha256(CONFIG.read_bytes()).hexdigest()[:12]
-        print(f"[restore] 已还原配置 ({sha})", flush=True)
+        # 变体全部写在 /tmp，**生产配置文件从未被改动** —— 这里不需要还原。
+        print("[restore] 生产配置未改动（变体在 /tmp）", flush=True)
 
     print()
     header = f"{'配置':<38}{'txt1':>5}{'txt3':>6}{'txtMRR':>9}{'ids1':>6}{'ids3':>6}{'idsMRR':>9}{'half':>10}"

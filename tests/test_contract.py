@@ -190,3 +190,32 @@ def test_query_expansion_is_off_by_default_and_gated_by_top_k():
     blended = blend_query_vector(base, [[0.0, 1.0, 0.0]], 0.4)
     assert abs(sum(v * v for v in blended) - 1.0) < 1e-9, "插值后必须重新归一化"
     assert blended[1] > 0, "扩展词的方向应当被混入"
+
+
+def test_prf_merge_policies_append_never_reorders_base():
+    """`merge_policy="append"` 必须保证原排名逐位不变（用户设计意图的严格版）。
+
+    实测（BEAM 60 题）：`score` 模式下新候选会顶掉原 top-1（txt1 49→46），
+    而 `append` 把新条目全部放在原排名之后——原指标严格无损，只在 top_k /
+    token 预算允许时多交几条证据。
+    """
+    from types import SimpleNamespace
+
+    from memorysum.services.search import _merge_ranked
+
+    def entry(view_id):
+        return SimpleNamespace(view_id=view_id, candidate=SimpleNamespace(best_rank=1))
+
+    base = [(entry("a"), 0.5), (entry("b"), 0.4), (entry("c"), 0.3)]
+    extra = [(entry("d"), 0.9), (entry("a"), 0.95), (entry("e"), 0.8)]
+
+    appended = _merge_ranked(base, extra, "append")
+    assert [item.view_id for item, _score in appended] == ["a", "b", "c", "d", "e"]
+    scores = {item.view_id: score for item, score in appended}
+    assert scores["a"] == 0.5, "append 模式不得改写原有条目的分数"
+
+    scored = _merge_ranked(base, extra, "score")
+    assert [item.view_id for item, _score in scored] == ["d", "e", "a", "b", "c"], (
+        "score 模式按分数降序；原条目保留 base 里的打分（先见先保留）"
+    )
+    assert {item.view_id: score for item, score in scored}["a"] == 0.5

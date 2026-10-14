@@ -143,13 +143,32 @@ def _mean_cosine(base: Sequence[float], vectors: Sequence[Sequence[float]]) -> f
 def _merge_ranked(
     base: Sequence[tuple[RerankEntry, float]],
     extra: Sequence[tuple[RerankEntry, float]],
+    policy: str = "score",
 ) -> list[tuple[RerankEntry, float]]:
-    """把二次检索的排名并进原排名：按 view_id 去重，各自的分数保留，整体按分数降序。
+    """把二次检索的排名并进原排名：按 view_id 去重，各自的分数保留。
 
-    两侧的分数来自**同一个 reranker 对同一个原始查询**的打分，所以可比；这也是
-    "扩展只补位、不顶替"的实现方式 —— 原有条目的分数不会被改写。
+    两种策略（`query_expansion.merge_policy`）：
+    - `score`：整体按分数降序。两侧的分数来自**同一个 reranker 对同一个原始查询**的
+      打分，所以可比；但实测新候选会顶掉原 top-1（BEAM 60 题：txt1 49→46）——
+      因为 rerank 分数的头部噪声被新候选放大。
+    - `append`：新候选只追加在原排名之后（新增部分按分数排序）。原排名逐位不变，
+      扩展只在 top_k / token 预算允许时多交证据。这是“扩展只补位、不顶替”的
+      严格版，对原指标严格无损。
     """
-    seen: set[str] = set()
+    if policy == "append":
+        seen: set[str] = set()
+        tail: list[tuple[RerankEntry, float]] = []
+        for entry, score in base:
+            seen.add(entry.view_id)
+        for entry, score in extra:
+            if entry.view_id in seen:
+                continue
+            seen.add(entry.view_id)
+            tail.append((entry, score))
+        tail.sort(key=lambda item: (-item[1], item[0].candidate.best_rank, item[0].view_id))
+        return list(base) + tail
+
+    seen = set()
     merged: list[tuple[RerankEntry, float]] = []
     for entry, score in list(base) + list(extra):
         if entry.view_id in seen:
@@ -419,7 +438,7 @@ class SearchService:
                 deadline,
             )
             if extra:
-                ranked = _merge_ranked(ranked, extra)
+                ranked = _merge_ranked(ranked, extra, expansion.merge_policy)
                 diagnostics["prf_added"] = len(extra)
         response = self._select_output(ranked, request.top_k, mode, question_cost, request.query)
         diagnostics["returned_records"] = len(response.data)
@@ -462,6 +481,7 @@ class SearchService:
         if (
             self._pipeline.coverage.conditional_full_requires_wide_or_context_mode
             and not wide_or_context
+            and not self._pipeline.coverage.always_full_for_all_queries
         ):
             return None
 

@@ -73,7 +73,7 @@
     },
     "neighbor_expand_chars": 0,
     "channel_consensus_bonus": 0.0,
-    "similarity_weight": 0.0,
+    "similarity_weight": 0.05,
     "consensus_weight": 0.0,
     "speaker_weight": 0.0,
     "per_source_cap": 1,
