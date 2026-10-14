@@ -46,6 +46,7 @@ def main() -> int:
     parser.add_argument("--out", default="/tmp/evidence_dump.md")
     parser.add_argument("--per-record", type=int, default=420)
     parser.add_argument("--records", type=int, default=8)
+    parser.add_argument("--top-k", type=int, default=10, help="平台口径用 100")
     args = parser.parse_args()
 
     questions: dict[str, str] = {}
@@ -70,7 +71,7 @@ def main() -> int:
         capability = capability_of(query)
         diagnostics: dict[str, object] = {}
         response = service.search(
-            SearchRequest(query=query, user_id=user_id, top_k=10), diagnostics=diagnostics
+            SearchRequest(query=query, user_id=user_id, top_k=args.top_k), diagnostics=diagnostics
         )
         reference = service._database.resolve_scope(user_id, create=False)  # noqa: SLF001
         connection = service._database.connect(reference, user_id)
@@ -79,7 +80,8 @@ def main() -> int:
         connection.close()
         out.append(
             f"\n### [{index:>2}] {capability} | scope {messages} 条消息 / {windows} 窗口 | "
-            f"strategy={diagnostics.get('strategy')} | 返回 {len(response.data)} 条\n"
+            f"strategy={diagnostics.get('strategy')} | 返回 {len(response.data)} 条 | "
+            f"候选 {diagnostics.get('candidate_windows')} / 组 {diagnostics.get('rerank_groups')}\n"
             f"Q: {compact(query, 900)}\n"
         )
         for rank, item in enumerate(response.data[: args.records], start=1):

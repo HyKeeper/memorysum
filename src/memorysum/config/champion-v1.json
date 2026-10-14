@@ -19,9 +19,9 @@
     "instruction": "",
     "single_pair_proxy_tokens": 4608,
     "max_query_proxy_tokens": 6144,
-    "ordinary_pair_proxy_budget": 24000,
+    "ordinary_pair_proxy_budget": 48000,
     "wide_pair_proxy_budget": 48000,
-    "ordinary_candidate_groups": 64,
+    "ordinary_candidate_groups": 100,
     "wide_candidate_groups": 100,
     "batch_groups": 16,
     "max_concurrency": 4
@@ -57,8 +57,8 @@
       "chinese_fts": 24,
       "options_lexical": 16,
       "candidate_cap": 384,
-      "output_records": 64,
-      "output_tokens": 32768
+      "output_records": 100,
+      "output_tokens": 65536
     },
     "wide": {
       "leaf_dense": 128,
@@ -68,13 +68,13 @@
       "options_lexical": 16,
       "candidate_cap": 512,
       "output_records": 100,
-      "output_tokens": 49152
+      "output_tokens": 98304
     },
     "neighbor_expand_chars": 0,
     "similarity_weight": 0.0,
     "consensus_weight": 0.0,
     "speaker_weight": 0.0,
-    "per_source_cap": 2,
+    "per_source_cap": 1,
     "term_coverage_weight": 0.0
   },
   "groups": {
