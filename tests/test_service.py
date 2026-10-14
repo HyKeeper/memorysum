@@ -645,7 +645,12 @@ def test_time_anchor_is_added_only_for_temporal_questions_and_only_when_enabled(
             ).json()
         return " ".join(body["data"][0]["content"].split())
 
-    off = search(make_app(tmp_path / "a", FakeProvider()), "When did Caroline go?")
+    off = search(
+        make_app(
+            tmp_path / "a", FakeProvider(), groups_overrides={"time_anchor_in_text": False}
+        ),
+        "When did Caroline go?",
+    )
     assert "26 Jan, 2024" not in off  # 默认关闭：逐字原文
     assert off.startswith("[locomo_refined]")
 
