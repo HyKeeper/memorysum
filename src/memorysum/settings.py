@@ -90,6 +90,10 @@ class RetrievalConfig(FrozenConfig):
     #: ranking can fill the whole budget with windows of a single chatty chunk.
     #: 0 disables the cap.
     per_source_cap: int = 0
+    #: Reward windows that actually mention the query's content words (stopwords and
+    #: short tokens dropped). Cheaper and softer than FTS: a window covering more of
+    #: the question's terms is likelier to hold the answer, regardless of phrasing.
+    term_coverage_weight: float = 0.0
     #: Widen every returned passage by N source characters on both sides. Neighbouring
     #: text often holds the second half of a multi-hop answer, which leaf windows cut
     #: away; 0 keeps the response byte-identical to the indexed window.
@@ -102,6 +106,13 @@ class GroupConfig(FrozenConfig):
     max_spans: int
     direct_max_tokens: int
     context_max_tokens: int
+    #: Keep the first N returned records at full length and trim the rest to
+    #: `tail_cut_chars`. Whether the platform truncates the response by token budget
+    #: or passes it all through is unknown, and the two regimes want opposite
+    #: shapes (few long records vs many short ones). A long head plus a compact tail
+    #: is near-optimal under both. 0 disables the split.
+    head_records: int = 0
+    tail_cut_chars: int = 0
 
 
 class CoverageConfig(FrozenConfig):

@@ -92,6 +92,13 @@ class RerankEntry:
 
 
 _SPEAKER_RE = re.compile(r"(?m)^([A-Z][a-z]{2,15}):\s")
+_WORD_RE = re.compile(r"[a-z]{4,}")
+_STOP = frozenset(
+    """about after again against also because been before being below between both
+could doing down during each few from further have having here into itself just like more most
+only other over same should some such than that their them then there these they this those
+through under until very were what when where which while will with would your yours""".split()
+)
 _WORD_CACHE: dict[str, re.Pattern[str]] = {}
 
 
@@ -1021,9 +1028,12 @@ class SearchService:
             )
             for index in range(len(entries))
         ]
+        coverage_alpha = float(
+            getattr(self._pipeline.retrieval, "term_coverage_weight", 0.0) or 0.0
+        )
         alpha = float(getattr(self._pipeline.retrieval, "consensus_weight", 0.0) or 0.0)
         speaker_alpha = float(getattr(self._pipeline.retrieval, "speaker_weight", 0.0) or 0.0)
-        if (alpha > 0 or speaker_alpha > 0) and len(fused) > 1:
+        if (alpha > 0 or speaker_alpha > 0 or coverage_alpha > 0) and len(fused) > 1:
             high = max(score for _, score in fused) or 1.0
             low = min(score for _, score in fused)
             span = (high - low) or 1.0
@@ -1051,9 +1061,15 @@ class SearchService:
                     names.update(_SPEAKER_RE.findall(entry.response_content))
                 targets = {name for name in names if _word_re(name).search(query)}
 
+            # Content-word coverage of the question (soft lexical agreement).
+            q_terms = set(_WORD_RE.findall(query.lower())) - _STOP
             boosted = []
             for entry, norm in normalised:
                 score = norm
+                if coverage_alpha and q_terms:
+                    text = entry.response_content.lower()
+                    hit = sum(1 for term in q_terms if term in text)
+                    score += coverage_alpha * (hit / len(q_terms))
                 if alpha > 0:
                     key = _primary_message_id(entry)
                     others = counts[key] - 1
@@ -1198,6 +1214,18 @@ class SearchService:
                         widened.append(raw[left:right])
                 if widened:
                     content = attach_anchor(_RESPONSE_SPAN_SEPARATOR.join(widened), entry.anchor)
+            head_records = int(getattr(self._pipeline.groups, "head_records", 0) or 0)
+            tail_cut = int(getattr(self._pipeline.groups, "tail_cut_chars", 0) or 0)
+            if (
+                tail_cut
+                and head_records
+                and len(selected) >= head_records
+                and len(content) > tail_cut
+            ):
+                # Budget-agnostic shape: early records stay complete (they are the
+                # ones a truncating platform is certain to keep), later ones are
+                # trimmed so a token-capped response still fits more of them.
+                content = content[:tail_cut].rstrip()
             content_key = " ".join(content.split()).casefold()
             if content_key in seen_content:
                 continue
