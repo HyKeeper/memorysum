@@ -22,7 +22,7 @@ from memorysum.settings import PipelineConfig
 
 logger = logging.getLogger(__name__)
 _GIB = 1024**3
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
@@ -60,12 +60,46 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     # implicitly committed: without an explicit commit the version bump is rolled
     # back on close and the scope would migrate again (and re-scan) on every open.
     connection.commit()
+    connection.execute("PRAGMA user_version = 3")
+    connection.commit()
+    logger.info(
+        "Migrated scope schema v2 -> v3: %d/%d messages carry harness metadata",
+        backfilled,
+        len(rows),
+    )
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Backfill harness ids for headers only the newer parser understands.
+
+    v3 fed `parse_chunk_metadata` a single header shape (`[<TAG>_META …]`), so scopes
+    using the platform's *bracket cluster* header (`[locomo_refined][session_1][D1:3]
+    [text] …`, `[memtrapbench]…`, `[angry]…`) stored NULL ids — measured 2695/2695
+    messages in the 2026-10-14 smoke scopes, i.e. every hit came back with
+    `source_ids: []` even though the harness id sits in the text. Re-parsing is
+    deterministic and touches only NULL rows, so existing ids are never rewritten and
+    an interrupted run simply retries.
+    """
+    rows = connection.execute(
+        "SELECT message_id, raw_content FROM messages WHERE metadata_ids IS NULL"
+    ).fetchall()
+    filled = 0
+    for row in rows:
+        metadata = parse_chunk_metadata(str(row["raw_content"]))
+        if not metadata.identifiers:
+            continue
+        connection.execute(
+            "UPDATE messages SET metadata_ids = ? WHERE message_id = ?",
+            (json.dumps(list(metadata.identifiers), ensure_ascii=False), int(row["message_id"])),
+        )
+        filled += 1
+    connection.commit()
     connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     connection.commit()
     logger.info(
-        "Migrated scope schema v2 -> v%d: %d/%d messages carry harness metadata",
+        "Migrated scope schema v3 -> v%d: %d/%d messages gained harness ids",
         _SCHEMA_VERSION,
-        backfilled,
+        filled,
         len(rows),
     )
 
@@ -580,6 +614,9 @@ class DatabaseManager:
             return
         if version == 2:
             _migrate_v2_to_v3(connection)
+            version = 3
+        if version == 3:
+            _migrate_v3_to_v4(connection)
             return
         raise StorageError()
 

@@ -413,3 +413,67 @@ def test_rerank_fusion_blends_rerank_and_retrieval_rankings():
     # A: 1/63 + 2/61 = 0.04866   B: 1/62 + 2/62 = 0.04839   C: 1/61 + 2/63 = 0.04814
     assert [pair[0].candidate.window_id for pair in ordered] == [1, 2, 3]
     assert service._pipeline.reranker.fusion_weight == 2.0
+
+
+def test_chunk_metadata_lifts_ids_from_the_platform_bracket_cluster_header():
+    """The platform's own header shape carries the harness id in `D<session>:<turn>`.
+
+    2026-10-14: 2695/2695 messages in the smoke scopes stored NULL ids, so every hit
+    came back with `source_ids: []` while the id was sitting in the text. Only the
+    *leading* bracket run counts — MCQ option lists and arithmetic brackets must not
+    be mistaken for ids.
+    """
+    from memorysum.core.metadata import parse_chunk_metadata
+
+    cases = {
+        "[locomo_refined][session_1][D1:3][text] Caroline: I went to a LGBTQ support group": (
+            "D1:3",
+        ),
+        "[memtrapbench][session_1][D1:1][text] user: configure a high-fidelity CFD study": (
+            "D1:1",
+        ),
+        "[angry][session_1][D1:34][narration] NARRATION: The whole feeling is one of movement": (
+            "D1:34",
+        ),
+        "[clbench_16_32k][session_1][D1:5][text] assistant: Based on the provided dataset": (
+            "D1:5",
+        ),
+        "[personamem_v2_32k][session_1][D1:121][text] Assistant: gentle stretching or yoga": (
+            "D1:121",
+        ),
+    }
+    for content, expected in cases.items():
+        assert parse_chunk_metadata(content).identifiers == expected
+
+    # 不是 id 的方括号：算 24 的数字列表、选项、正文里出现的括号都不算
+    for content in (
+        "Reach 24 using the numbers [5, 5, 5, 8].",
+        "What does the camera imply? A. [D1] the hub B. [D2] the elevator",
+        "[Time: Sep 04, 2025, 09:51:27] My highest education level is PhD",
+    ):
+        assert parse_chunk_metadata(content).identifiers == ()
+
+
+def test_chunk_metadata_keeps_the_meta_line_shape_working():
+    from memorysum.core.metadata import parse_chunk_metadata
+
+    metadata = parse_chunk_metadata(
+        "[BEAM_META chunk_id=beam128k_conv1_session3_chunk158 source_ids=1:msg171]\n"
+        "BEAM conversation 1 · Session 3\n"
+        "User: hello"
+    )
+    assert metadata.identifiers == ("1:msg171",)
+    assert metadata.chunk_id == "beam128k_conv1_session3_chunk158"
+    assert metadata.anchor == "BEAM conversation 1 · Session 3"
+
+
+def test_chunk_metadata_lifts_the_streaming_task_index():
+    from memorysum.core.metadata import parse_chunk_metadata
+
+    payload = (
+        'Streaming intra-transfer train trajectory: {"dataset": "ALF", "eval_feedback":'
+        ' {"finish": true, "messages": []}, "schema_version": "streaming-intra-transfer-'
+        'trajectory-v1", "task_index": 86, "trajectory": []}'
+    )
+    assert parse_chunk_metadata(payload).identifiers == ("ALF#86", "86")
+    assert parse_chunk_metadata("no payload here").identifiers == ()

@@ -547,3 +547,71 @@ def test_response_body_stays_verbatim_unless_whitespace_collapse_is_requested(tm
         "\t" not in item["content"] and "\n\n" not in item["content"] for item in collapsed["data"]
     )
     assert any("Tea first." in item["content"] for item in collapsed["data"])
+
+
+def test_cluster_header_ids_reach_the_response_and_survive_the_v4_backfill(tmp_path):
+    """End-to-end for the bracket-cluster header fix, including the v3->v4 backfill.
+
+    The platform's smoke scopes use `[<suite>][session_N][D<d>:<t>][text]` headers, so
+    before v4 every hit carried `source_ids: []`. This covers both halves: a fresh Add
+    stores the lifted ids, and an older scope (ids NULLed, user_version=3) gets them
+    backfilled on the next open.
+    """
+    import sqlite3
+
+    from memorysum.core.identity import scope_id
+
+    provider = FakeProvider()
+    data_root = tmp_path / "data"
+    app = make_app(data_root, provider)
+    payload = {
+        "request_id": "add-cluster",
+        "user_id": "cluster-user",
+        "session_id": "session-1",
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": 1704067200000,
+                "content": (
+                    "[locomo_refined][session_1][D1:3][text] Caroline: I went to a LGBTQ "
+                    "support group yesterday and it was so powerful. I also prefer tea."
+                ),
+            }
+        ],
+    }
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        assert client.post("/add", json=payload).status_code == 200
+        found = client.post(
+            "/search",
+            json={
+                "query": "When did Caroline go to the support group?",
+                "user_id": "cluster-user",
+                "top_k": 5,
+            },
+        ).json()
+        assert found["data"], "the passage must come back"
+        assert found["data"][0]["source_ids"] == ["D1:3"]
+
+    # 模拟 v3 时代的库：抹掉 ids、把版本退回 3，再开一次应触发 v3→v4 回填
+    scope_file = data_root / "scopes" / f"{scope_id('cluster-user')}.sqlite3"
+    connection = sqlite3.connect(scope_file)
+    connection.execute("UPDATE messages SET metadata_ids = NULL")
+    connection.execute("PRAGMA user_version = 3")
+    connection.commit()
+    connection.close()
+
+    with TestClient(
+        make_app(data_root, FakeProvider()), headers={"Authorization": "Bearer test-secret"}
+    ) as client:
+        again = client.post(
+            "/search",
+            json={
+                "query": "When did Caroline go to the support group?",
+                "user_id": "cluster-user",
+                "top_k": 5,
+            },
+        ).json()
+    assert again["data"][0]["source_ids"] == ["D1:3"], "backfill must restore the id"
+    connection = sqlite3.connect(scope_file)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    connection.close()

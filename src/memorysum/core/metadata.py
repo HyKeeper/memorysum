@@ -42,6 +42,65 @@ _CHUNK_ID_RE = re.compile(r"\bchunk_id[ \t]*=[ \t]*(?P<value>[^\s\]]+)", re.IGNO
 #: the response payload.
 _MAX_IDS = 512
 
+#: The platform's own message headers are a leading bracket cluster rather than a
+#: `[<TAG>_META ...]` line, e.g.
+#:     [locomo_refined][session_1][D1:3][text] Caroline: I went to a LGBTQ support group…
+#:     [memtrapbench][session_1][D1:1][text] user: I want to configure a high-fidelity CFD…
+#:     [angry][session_1][D1:34][narration] NARRATION: The whole feeling is one of movement…
+#: The id the platform can match against gold lives in the `D<session>:<turn>` token —
+#: the same id space as the `[LOCOMO_META ... source_ids=D19:1,D19:2]` form we already
+#: parse. 2026-10-14 measurement: 2695/2695 messages in the smoke scopes carried *no*
+#: ids, so every hit came back with `source_ids: []` even though the harness id was
+#: right there in the text.
+_BRACKET_RE = re.compile(r"\[([^\[\]]{1,64})\]")
+#: `D1:3`, `D19:1`, `1:msg108`, or a comma-separated list of the same.
+_ID_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*:\d+")
+
+
+#: 流式任务载荷（ALF/DB）里唯一的标识就是 `dataset` + `task_index`：
+#:     Streaming intra-transfer train trajectory: {"dataset": "ALF", "task_index": 86, …}
+#: 平台的问法也是字面量（"ALF task index 86"），所以照它的字段提两个形态：
+#: 裸索引 `86` 与复合 `ALF#86`（不发明别的格式；多给的 id 在交集匹配下无害）。
+_TRAJECTORY_RE = re.compile(
+    r'"dataset"\s*:\s*"(?P<dataset>[A-Za-z0-9_]+)".{0,200}?"task_index"\s*:\s*(?P<index>\d+)',
+    re.DOTALL,
+)
+
+
+def _trajectory_identifiers(content: str) -> tuple[str, ...]:
+    head = content[:600]
+    if "train trajectory" not in head:
+        return ()
+    match = _TRAJECTORY_RE.search(head)
+    if match is None:
+        return ()
+    return (f"{match.group('dataset')}#{match.group('index')}", match.group("index"))
+
+
+def _cluster_identifiers(content: str) -> tuple[str, ...]:
+    """Ids from a leading bracket cluster; empty when the cluster is not there.
+
+    Only the *contiguous* run of brackets at the start counts: text further in can
+    contain unrelated brackets (MCQ option lists, arithmetic like `[5, 5, 5, 8]`).
+    """
+    text = content.lstrip()
+    ids: list[str] = []
+    position = 0
+    while position < len(text) and text[position] == "[":
+        match = _BRACKET_RE.match(text, position)
+        if match is None:
+            break
+        for token in match.group(1).split(","):
+            token = token.strip()
+            if _ID_TOKEN_RE.fullmatch(token):
+                ids.append(token)
+        position = match.end()
+        while position < len(text) and text[position] in " \t":
+            position += 1
+        if len(ids) >= _MAX_IDS:
+            break
+    return tuple(dict.fromkeys(ids))[:_MAX_IDS]
+
 
 @dataclass(frozen=True)
 class ChunkMetadata:
@@ -64,7 +123,12 @@ def parse_chunk_metadata(content: str) -> ChunkMetadata:
     """
     match = _META_LINE_RE.search(content)
     if match is None:
-        return ChunkMetadata()
+        # A leading bracket cluster is the platform's other header shape; it carries
+        # ids but no anchor (there is no date line to lift). Streaming-task payloads
+        # identify themselves by (dataset, task_index) instead of a header.
+        return ChunkMetadata(
+            source_ids=_cluster_identifiers(content) or _trajectory_identifiers(content)
+        )
 
     body = match.group("body")
     source_ids: tuple[str, ...] = ()
