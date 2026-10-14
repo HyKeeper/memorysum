@@ -298,12 +298,28 @@ class SearchService:
         diagnostics["strategy"] = "hybrid_retrieval"
         diagnostics["channel_hits"] = {name: len(ids) for name, ids, _ in channels}
         mode = self._pipeline.retrieval.wide if wide_mode else self._pipeline.retrieval.ordinary
+        rrf_k = self._pipeline.retrieval.rrf_k
+        if getattr(self._pipeline.retrieval, "rrf_k_adaptive", False):
+            # 按去重前的候选总量缩放 k：RRF 原论文的 k=60 是在 TREC 量级语料上调的，
+            # 而这里的候选列表只有几十到几百条 —— 见 docs/round8-prereg.md 的扫描。
+            unique = len(
+                {
+                    int(entry) if not isinstance(entry, (tuple, list)) else int(entry[0])
+                    for _, entries, _ in channels
+                    for entry in entries
+                }
+            )
+            rrf_k = max(10, min(30, unique // 3))
+            diagnostics["rrf_k"] = rrf_k
         fused = reciprocal_rank_fusion(
             channels,
-            k=self._pipeline.retrieval.rrf_k,
+            k=rrf_k,
             limit=mode.candidate_cap,
             similarity_weight=float(
                 getattr(self._pipeline.retrieval, "similarity_weight", 0.0) or 0.0
+            ),
+            channel_consensus_bonus=float(
+                getattr(self._pipeline.retrieval, "channel_consensus_bonus", 0.0) or 0.0
             ),
         )
         diagnostics["candidate_windows"] = len(fused)

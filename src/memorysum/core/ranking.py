@@ -20,6 +20,7 @@ def reciprocal_rank_fusion(
     k: int = 60,
     limit: int,
     similarity_weight: float = 0.0,
+    channel_consensus_bonus: float = 0.0,
 ) -> list[FusedCandidate]:
     """Fuse ranked window IDs; duplicate results add channel evidence only once.
 
@@ -30,6 +31,13 @@ def reciprocal_rank_fusion(
     (min-max), so channels with different scoring scales stay comparable and the
     rank term keeps dominating. ``similarity_weight`` 0 reproduces the pure-rank
     behaviour exactly.
+
+    ``channel_consensus_bonus`` adds a **multiplicative** reward for being found by
+    several channels at once (``score *= 1 + bonus*(n-1)``). Pure RRF already sums
+    each channel's contribution, which is additive and therefore linear in the
+    number of channels; the multiplication is what makes a three-channel hit stand
+    out from a single-channel top-1 rather than merely tie with it. 0 keeps the
+    historical behaviour.
     """
     candidates: dict[int, FusedCandidate] = {}
     for channel_name, entries, weight in channels:
@@ -59,6 +67,12 @@ def reciprocal_rank_fusion(
                 candidate.score += similarity_weight * ((sim - low) / span)
             candidate.best_rank = min(candidate.best_rank, rank)
             candidate.channels.add(channel_name)
+
+    if channel_consensus_bonus:
+        for candidate in candidates.values():
+            extra = len(candidate.channels) - 1
+            if extra > 0:
+                candidate.score *= 1.0 + channel_consensus_bonus * extra
 
     return sorted(
         candidates.values(),

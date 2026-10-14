@@ -75,6 +75,12 @@ class RetrievalModeConfig(FrozenConfig):
 
 class RetrievalConfig(FrozenConfig):
     rrf_k: int
+    #: Scale `rrf_k` to the candidate count instead of using a fixed value
+    #: (``k = clamp(unique_candidates / 3, 10, 30)``). RRF's own paper tuned k=60 on
+    #: TREC-scale corpora; here the candidate list runs 40-254 windows, and a fixed k
+    #: under-discounts the head on small lists while flattening it on large ones.
+    #: Measured: k=20 beats k=60 on both txt_all and ids_all at our typical size.
+    rrf_k_adaptive: bool = False
     base_channel_weight: float
     #: Per-channel fusion weights; unlisted channels fall back to base_channel_weight.
     channel_weights: dict[str, float]
@@ -83,6 +89,12 @@ class RetrievalConfig(FrozenConfig):
     #: rank contribute identically); >0 min-max normalises each channel and adds
     #: the score as a bounded tie-breaker. 0 = pure rank fusion.
     similarity_weight: float = 0.0
+    #: Multiplicative reward for being found by several channels at once
+    #: (``score *= 1 + bonus*(n-1)``). Plain RRF adds each channel's contribution,
+    #: which is linear in the channel count; multiplying is what lets a three-channel
+    #: hit clearly outrank a single-channel top-1 instead of merely tying with it.
+    #: 0 keeps the historical additive behaviour.
+    channel_consensus_bonus: float = 0.0
     #: Chunk-level agreement vote applied after ranking: an entry gains score when
     #: other strong candidates come from the same source message. Multi-hop answers
     #: often need two turns of one chunk, so this lifts that chunk's windows.

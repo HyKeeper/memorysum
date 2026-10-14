@@ -41,7 +41,8 @@
     }
   },
   "retrieval": {
-    "rrf_k": 60,
+    "rrf_k": 20,
+    "rrf_k_adaptive": true,
     "base_channel_weight": 1.0,
     "channel_weights": {
       "leaf_dense": 2.0,
@@ -71,6 +72,7 @@
       "output_tokens": 98304
     },
     "neighbor_expand_chars": 0,
+    "channel_consensus_bonus": 0.0,
     "similarity_weight": 0.0,
     "consensus_weight": 0.0,
     "speaker_weight": 0.0,
