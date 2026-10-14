@@ -107,6 +107,19 @@ predicted_answer/score/method），证据来自我们自己的检索**。
 
 每轮的固定四步（判据见下，必须跨轮一致，否则分数不可比）：
 
+**第 -1 步（新增，2026-10-14）：确认 scope 纯净**。scope 按 `sha256(user_id)` 落盘，
+**同一 user_id 再次 Add 是追加而不是替换**（平台每轮重建 scope 用新 `request_id`，所以不幂等）。
+如果 smoke 与 full 复用同一批 user_id，full 会在 smoke 的数据上叠加 —— 不只是库变大，
+smoke 的问答对还可能被直接命中。实测平台前 5 轮都是**全新 user_id**（两两交集为 0），
+但下一轮不保证：
+
+```bash
+.venv/bin/python scripts/scope_purity.py check --requests backups/<轮次>/requests.jsonl
+# exit 0 = 全部本轮新建；exit 2 = 发现早于本轮就存在的 scope（列出 user_id）
+# 清理（**先停服务**）：加 --yes 才真删；先不加跑一次看 dry-run
+.venv/bin/python scripts/scope_purity.py purge --requests backups/<轮次>/requests.jsonl --yes
+```
+
 ```bash
 # 0) 切日志（锚点行在 backups/marker-*.json）+ 抽请求与平台信号 + 快照 scope
 .venv/bin/python scripts/extract_loadtest_requests.py <切片> backups/<轮次>/requests.jsonl
