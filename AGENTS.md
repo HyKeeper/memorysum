@@ -125,6 +125,17 @@ ids_all 对齐（39/60、0.745），不是质量下滑——详见第 32、33 �
 - **重启服务前先看活动连接**：`ss -tn state established '( sport = :8001 )'`。有 keep-alive 连接时 uvicorn 会等满超时（实测停机 10.9 s）；无连接时 ~0.16 s。要么等连接空闲，要么 SIGTERM 后 2 秒直接 SIGKILL（~0.2 s）。**用户要求尽量别让服务停太久。**
 - **`pkill -f '<pattern>'` 会杀掉执行它的 shell 自身**（pattern 出现在自己的命令行里，实测 exit 143）→ 用 `ps -eo pid,args | grep -F ... | grep -v grep | awk '{print $1}'` 取 PID，或 `pkill -x <进程名>`。
 - **后台任务用 `setsid`**：`nohup` 只挡 SIGHUP，工具调用超时的 SIGTERM 会带走子进程。
+- **重启用 `ss -tlnpH 'sport = :8001'` 反查 PID，不要用 `pgrep -f`**（2026-10-14 踩了两次，两次重启都没生效
+  却以为成功了）：`pgrep -f "\.venv/bin/memorysum" | head -1` 会先匹配到**自己那层 bash 包装**
+  （命令行里就含这个字符串），于是 kill 打到了错的目标，真服务（监听 8001 那个）根本没死，
+  新进程静默退出。**验证重启成功要看 PID 变了**，不能只看 `health 200`（旧进程也会答 200）：
+  ```bash
+  REAL=$(ss -tlnpH 'sport = :8001' | grep -oP 'pid=\K[0-9]+' | head -1)
+  kill -TERM $REAL; sleep 1.5; kill -9 $REAL; setsid nohup .venv/bin/python .venv/bin/memorysum >> logs/memorysum.log 2>&1 &
+  sleep 4; NEW=$(ss -tlnpH 'sport = :8001' | grep -oP 'pid=\K[0-9]+' | head -1); echo "$NEW" > logs/memorysum.pid
+  [ "$NEW" != "$REAL" ] && echo "真的换了进程 ✅" || echo "没重启成功 ❌"
+  ```
+  停机实测 4.5~6.0 s（有平台 keep-alive 连接时）。
 - **三种服务都是裸进程**，机器重启不自动恢复（尚无 systemd unit）；memorysum 依赖 7999/7997 可达，否则 Add/Search 返回 503。
 - **读压测/评测日志别用"就近的 http_request 行"配对结构化事件**：Add/Search 的 `api_*` 事件行与 uvicorn 的 `http_request` 行是并发交错的，实测会把 Add 的 payload 配到 Search 的状态码上。**按 `trace_id` 关联**才对（工具：`scripts/extract_loadtest_requests.py`）。另外 `api_*` 事件行只在 `MEMORYSUM_DEBUG` 打开时才写。
 - 数据目录 `data/`、`logs/`、`keys.txt`、`.env` 都在 `.gitignore` 里；`keys.txt` 每行一个裸 Bearer token。

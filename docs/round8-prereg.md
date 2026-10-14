@@ -6,6 +6,13 @@
 
 ## 变更（相对 18:38 轮的 `def92ae229b1`）
 
+**另外还有一个 API 契约层的修复（`dbd6bd1`），它可能比上面的参数放开更重要**：
+`Add`/`Search` 的请求 schema 原本是 `extra="forbid"`，平台只要带一个我们没声明的字段
+（实测会带 `session_id` / `filters` / `metadata` / `keyword_search`）就直接 **422**，
+而平台文档写明 422 **"不自动重试 + 当前阶段立即失败"**。全天日志里 **161 次** search 422，
+**round 5 的评测窗口内就有 12 次**、round 6 有 1 次。已改成 `extra="ignore"`（未声明的字段忽略，
+声明字段仍严格 —— `top_k` 依然是 `StrictInt`，因为契约写的是 integer 且从未观测到字符串形式）。
+
 | 参数 | 旧 | 新 | 依据 |
 |---|---|---|---|
 | `reranker.ordinary_candidate_groups` | 64 | **100** | 大 scope 被硬截断：`[21]` scope 289 条消息，diagnostics 恒为 `候选 184 / 组 64`；6 题命中此上限 |
