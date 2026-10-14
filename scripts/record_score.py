@@ -86,6 +86,7 @@ def main() -> int:
     service_line = process_info("memorysum") or "未运行"
 
     local_score = None
+    tree_score = None
     leaf_deltas: dict[str, float] = {}
     platform_leaves: dict[str, float] = {}
     if args.verdicts and Path(args.verdicts).exists():
@@ -100,17 +101,25 @@ def main() -> int:
         if args.tree and Path(args.tree).exists():
             tree = json.loads(Path(args.tree).read_text(encoding="utf-8"))
             platform_leaves = tree["runs"][-1]["leaves"]
+            merged = {leaf: 100.0 * sum(values) / len(values) for leaf, values in per_leaf.items()}
             for leaf, values in per_leaf.items():
                 if leaf in platform_leaves:
                     leaf_deltas[leaf] = round(
                         100.0 * sum(values) / len(values) - platform_leaves[leaf], 2
                     )
+            # 能力树口径：我们实测的叶子 + 观测不到的叶子（按平台该轮值代入，跨轮极稳）。
+            # 平台的总分≈其叶子均值（实测 ±1.2），所以这个口径才是能和他们对话的数字；
+            # 而按题等权的那个只是"证据充分性"上界（2026-10-14 实测偏高 8 分）。
+            for leaf, value in platform_leaves.items():
+                merged.setdefault(leaf, value)
+            tree_score = round(sum(merged.values()) / len(merged), 2)
 
     entry = {
         "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "round": args.round,
         "platform_total": args.total,
         "local_strict_total": local_score,
+        "local_tree_total": tree_score,
         "platform_leaves": platform_leaves,
         "leaf_deltas": leaf_deltas,
         "deployed_src": args.deployed_src or f"{head[:8]} {subject[:40]}",
@@ -152,8 +161,8 @@ def main() -> int:
         LEDGER.write_text(
             "# 平台跑分台账\n\n每一行 = 一次专家跑分，并记录当时的代码/配置指纹。\n"
             "**分数必须能对上环境才有意义**：同一个 commit 在改过 `-ub`、`config` 或模型服务后不再等价。\n\n"
-            "| 轮次 | 平台总分 | 本地严格分 | 差值 | 部署 src | 线上进程启动 | rerank `-ub` | 数据目录 |\n"
-            "|---|---|---|---|---|---|---|---|\n",
+            "| 轮次 | 平台总分 | 本地充分性 | 本地树口径 | 差值(树) | 部署 src | 线上进程启动 | rerank `-ub` | 数据目录 |\n"
+            "|---|---|---|---|---|---|---|---|---|\n",
             encoding="utf-8",
         )
     ub_match = re.search(r"-ub (\d+)", entry["rerank_server"])
@@ -161,7 +170,8 @@ def main() -> int:
     row = (
         f"| {args.round} | **{args.total:.2f}** | "
         f"{'' if local_score is None else f'{local_score:.2f}'} | "
-        f"{'' if local_score is None else f'{local_score - args.total:+.2f}'} | "
+        f"{'' if tree_score is None else f'{tree_score:.2f}'} | "
+        f"{'' if tree_score is None else f'{tree_score - args.total:+.2f}'} | "
         f"{entry['deployed_src']} | {service_started or '—'} | {rerank_ub or '—'} | "
         f"`{args.data or '—'}` |\n"
     )
@@ -174,7 +184,14 @@ def main() -> int:
     print(f"  线上服务       = {service_line[:110]}")
     print(f"  config sha256 = {entry['config_sha256'][:16]}  数据目录 = {args.data}")
     if local_score is not None:
-        print(f"  本地严格分 = {local_score:.2f}（差值 {local_score - args.total:+.2f}）")
+        print(
+            f"  本地证据充分性（按题等权） = {local_score:.2f}（差 {local_score - args.total:+.2f}）"
+        )
+    if entry.get("local_tree_total") is not None:
+        print(
+            f"  本地能力树口径（可与平台对话） = {entry['local_tree_total']:.2f}"
+            f"（差 {entry['local_tree_total'] - args.total:+.2f}）"
+        )
         print(f"  最大叶子偏差 = {sorted(leaf_deltas.items(), key=lambda kv: -abs(kv[1]))[:4]}")
     return 0
 

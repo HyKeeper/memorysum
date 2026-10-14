@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+from pathlib import Path
 
 #: 平台两次跑分的子能力百分比（A=13:25 那次 69.05，B=14:27 那次 68.08）与总分。
 PLATFORM = {
@@ -64,6 +65,10 @@ def main() -> int:
         "verdicts", nargs="?", default="backups/accuracy-2026-10-14/local_verdicts.jsonl"
     )
     parser.add_argument("--no-echo", action="store_true", help="剔除平台回灌记录相关的判定")
+    parser.add_argument(
+        "--tree",
+        help="平台分数表 json：用于把本地分换算成能力树口径（缺失的子能力按平台历史值代入）",
+    )
     args = parser.parse_args()
 
     rows = [json.loads(line) for line in open(args.verdicts, encoding="utf-8")]
@@ -101,12 +106,46 @@ def main() -> int:
             + " ".join(f"{c}={local_scores.get(c, float('nan')):.0f}" for c in children)
         )
 
+    # ── 两个口径 ────────────────────────────────────────────────────────────────
+    # ① 按题等权：衡量"我们交出去的证据够不够"，是平台端到端分的**上界**。
+    # ② 按子能力等权（能力树口径）：平台的树就是这样聚合的（实测他们的总分 ≈ 其叶子均值
+    #    ±1.2），所以要做预测必须换成这个口径；我们观测不到的 5 个子能力（C3/D2/E2/G2/I1
+    #    的实例不经过 /search）用平台最近一次的值代入——它们跨轮极稳（4 轮里 18/20 逐字相同）。
     total = 100.0 * sum(float(row["v"]) for row in rows) / len(rows)
+    print(f"\n① 证据充分性（按题等权，41 题）      = {total:.2f}")
+    leaf_scores = {leaf: 100.0 * sum(v) / len(v) for leaf, v in per_cap.items()}
+    missing = [leaf for leaf in PLATFORM if leaf not in leaf_scores]
+    if args.tree:
+        tree = (
+            json.loads(Path(args.tree).read_text(encoding="utf-8"))
+            if Path(args.tree).exists()
+            else None
+        )
+        reference = tree["runs"][-1] if tree else None
+        if reference:
+            filled = {
+                leaf: reference["leaves"][leaf] for leaf in missing if leaf in reference["leaves"]
+            }
+            merged = {**leaf_scores, **filled}
+            tree_score = sum(merged.values()) / len(merged)
+            print(
+                f"② 能力树口径（{len(leaf_scores)} 片实测 + {len(filled)} 片按平台"
+                f"『{reference['label']}』代入）= {tree_score:.2f}"
+                f"   平台总分 = {reference['total']:.2f}（差 {tree_score - reference['total']:+.2f}）"
+            )
+            print(f"   代入的片: {filled}")
+            print(
+                f"   仅按我们实测的 {len(leaf_scores)} 片等权 = "
+                f"{sum(leaf_scores.values()) / len(leaf_scores):.2f}"
+            )
+    else:
+        print(f"② 能力树口径：需要 --tree <平台分数表> 才能把缺失的 {len(missing)} 片补上")
+        print(
+            f"   仅按我们实测的 {len(leaf_scores)} 片等权 = {sum(leaf_scores.values()) / len(leaf_scores):.2f}"
+        )
     print(
-        f"\n本地总分（等权 41 题）= {total:.2f}   平台总分 = {PLATFORM_TOTAL[1]:.2f}（差 {total - PLATFORM_TOTAL[1]:+.2f}）"
+        "\n说明：①是上界（只看证据）；②才是能和平台对话的数字。两者之差 = 平台答题/判据层 + 聚合口径差。"
     )
-    print("差值来自两处：① 我们这类判定只看『证据够不够』，不看平台答题模型；")
-    print("            ② 平台还有 D2/G2/I1 等我们没有对应题的实例。")
     return 0
 
 
