@@ -105,12 +105,27 @@ predicted_answer/score/method），证据来自我们自己的检索**。
 每轮的固定四步（判据见下，必须跨轮一致，否则分数不可比）：
 
 ```bash
-.venv/bin/python scripts/dump_question_evidence.py            # ① 题+证据 → /tmp/evidence_dump.md
-.venv/bin/python scripts/eval_mechanical_rules.py <requests>  # ② 机械规则先判（省人读）
-#  ③ 人/agent 读余下部分 → backups/<轮次>/local_verdicts*.jsonl（每题一行 {i,cap,v,blame,note}）
-.venv/bin/python scripts/eval_local_score.py <verdicts>       # ④ 聚合成同形状能力树
+# 0) 切日志（锚点行在 backups/marker-*.json）+ 抽请求与平台信号 + 快照 scope
+.venv/bin/python scripts/extract_loadtest_requests.py <切片> backups/<轮次>/requests.jsonl
+.venv/bin/python scripts/extract_qa_feedback.py <切片> backups/<轮次>/platform_signals.jsonl
+.venv/bin/python scripts/backup_scopes.py backups/<轮次>
+# 1) 题+证据 → 2) 机械规则先判 → 3) 人/agent 补余下 → 4) 聚合 → 5) 对齐记账
+.venv/bin/python scripts/dump_question_evidence.py backups/<轮次>/requests.jsonl
+.venv/bin/python scripts/eval_mechanical_rules.py backups/<轮次>/requests.jsonl --compare <verdicts>
+#  人读 → backups/<轮次>/local_verdicts_strict.jsonl（每题一行 {i,cap,v,blame,note}）
+.venv/bin/python scripts/eval_local_score.py <verdicts>
 .venv/bin/python scripts/eval_alignment.py <verdicts> backups/<轮次>/platform_tree.json --record
 ```
+
+**专家只给 Add + query 也能跑**：`extract_qa_feedback.py` 现在把 /add 里嵌着的三类信号全抽出来
+——`suite`（`[<赛道>][session_N][D…]` 头部，每轮 ~11 条，用于约束"题→子能力"的映射）、
+`qa_feedback`（逐题判定）、`trajectory`（ALF/DB 流式任务的平台自评 `task_index`+`score`）。
+实测每轮 4 条判定 + 2 条任务自评 + 11 个赛道标签，**不需要专家额外导出任何东西**。
+
+**可达到的精度（留出验证）**：用平台 A 次的逐叶子偏差校准、预测 B 次 →
+**叶子命中 13/15（87%），总分残差 +0.97**，正好等于平台自己两轮之间的差值（69.05→68.08）。
+也就是说「本地 + 历史偏差」的预测能力已经到顶 = 平台自身的复现性；再想更准只能要实例清单
+（题→子能力映射）或全量逐实例判定，**按拿不到设计**。
 
 **严格判据**（宽松版「我能从证据读出答案」会给 81.71，严格版 68.29，平台真值 68.08）：
 

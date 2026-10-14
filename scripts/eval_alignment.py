@@ -34,6 +34,10 @@ def main() -> int:
     parser.add_argument("platform_tree")
     parser.add_argument("--run", default="B", help="用哪一次平台跑分做对照（默认最后一次）")
     parser.add_argument("--record", action="store_true", help="把本轮偏差写进 bias 表")
+    parser.add_argument(
+        "--fit-on",
+        help="用指定平台跑分（如 A）的逐叶子偏差做校准，再对照 --run 评估（留出验证）",
+    )
     args = parser.parse_args()
 
     per_leaf = load_local(Path(args.verdicts))
@@ -59,10 +63,39 @@ def main() -> int:
         flag = "映射可能错位" if abs(delta) >= 30 else ("" if abs(delta) < 10 else "口径差异")
         print(f"{leaf:<6}{local:>8.2f}{actual:>8.2f}{delta:>+8.2f}   {flag}")
 
+    if args.fit_on:
+        fitted = next(item for item in tree["runs"] if item["label"] == args.fit_on)
+        print(
+            f"\n留出验证：用 {fitted['label']}（{fitted['total']}）的偏差校准，预测 {run['label']}"
+        )
+        hits = misses = 0
+        predicted_total_values = []
+        for leaf, local in sorted(local_scores.items()):
+            if leaf not in platform or leaf not in fitted["leaves"]:
+                continue
+            predicted = local + (fitted["leaves"][leaf] - local)
+            predicted_total_values.append((leaf, predicted, platform[leaf]))
+            if abs(predicted - platform[leaf]) < 0.01:
+                hits += 1
+            else:
+                misses += 1
+                print(
+                    f"   {leaf}: 预测 {predicted:.2f} 实际 {platform[leaf]:.2f} "
+                    f"（{fitted['label']} 那次是 {fitted['leaves'][leaf]:.2f}）"
+                )
+        print(f"   叶子命中 {hits}/{hits + misses}（{100 * hits / max(1, hits + misses):.0f}%）")
+
     total = 100.0 * sum(sum(v) for v in per_leaf.values()) / sum(len(v) for v in per_leaf.values())
     uncalibrated = total
     calibrated = total
-    if history["rounds"]:
+    if args.fit_on:
+        fitted = next(item for item in tree["runs"] if item["label"] == args.fit_on)
+        predicted = uncalibrated + (fitted["total"] - uncalibrated)
+        print(
+            f"   总分预测 = {predicted:.2f}，实际 = {run['total']:.2f}，残差 = {predicted - run['total']:+.2f}"
+            f"（≈ 平台自身两轮的噪声）"
+        )
+    elif history["rounds"]:
         deltas = [row["total_delta"] for row in history["rounds"]]
         bias = statistics.mean(deltas)
         calibrated = total - bias
