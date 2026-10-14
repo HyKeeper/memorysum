@@ -57,3 +57,26 @@
 一行配置：`champion-v1.json` 的 `groups.time_anchor_scope` 改回 `"temporal"`，重启即回到
 16:35 轮的行为（该字段默认值就是 `"temporal"`，`test_time_anchor_scope_stays_declared_and_typed`
 守护它在 config 里显式存在、非法值报错）。
+
+## 跑分后处置（跑分前不要再重启/改配置，否则指纹不干净）
+
+```bash
+# 切日志（锚点行在 backups/marker-*.json）→ 抽流量与平台信号 → 快照 scope
+.venv/bin/python scripts/extract_loadtest_requests.py <切片> backups/round5/requests.jsonl
+.venv/bin/python scripts/extract_qa_feedback.py <切片> backups/round5/platform_signals.jsonl
+.venv/bin/python scripts/backup_scopes.py backups/round5
+# 本地判定（先机械规则，人/agent 补余下）→ 双口径 + 逐叶子对齐
+.venv/bin/python scripts/dump_question_evidence.py backups/round5/requests.jsonl
+.venv/bin/python scripts/eval_local_score.py <verdicts> --tree <树>
+.venv/bin/python scripts/eval_alignment.py <verdicts> <树> --record
+```
+
+**先看两件事，再谈总分**：
+1. **实例级**：`platform_signals.jsonl` 里 4 条 QA feedback 的 `score` 变化。
+   `locomo1` 必须仍是 1.0（回归）；任何**新翻正的实例**都是本轮的功劳，
+   任何原为 1.0 却翻负的实例优先归因为噪声（先与上一轮逐题对齐）。
+2. **预注册叶子**：C1/C2/I1 是否至少一片变化。注意叶子是 ~5 个实例的均值，
+   单实例翻转撼不动它 —— **叶子不动而实例变了也算成功**（16:35 轮的教训）。
+
+**本轮需要额外记的一笔**：`<切片>` 里所有 /search 的 `returned_chars`；如果超 4096 的题
+比例从 4/46 明显上升，说明锚点吃预算的效果需要与 `direct_max_tokens` 一起调（第 35/36 条）。
