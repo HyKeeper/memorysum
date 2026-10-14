@@ -97,6 +97,8 @@ class SearchRequest(StrictRequest):
     query: StrictStr
     options: list[StrictStr] | None = Field(default=None, max_length=_CAPACITY.max_search_options)
     user_id: StrictStr
+    # top_k 保持严格整数：契约（平台文档）明确它是 integer，而且"字符串 top_k"从未被观测到。
+    # 只放宽**未声明字段**（extra="ignore"），那是有实测证据的那一类。
     top_k: StrictInt = Field(ge=0)
 
     @field_validator("query")
