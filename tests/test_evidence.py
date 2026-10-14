@@ -78,7 +78,8 @@ def test_low_probability_is_rejected():
 
 def test_too_short_span_is_rejected():
     with patch(
-        "urllib.request.urlopen", return_value=_Response(_body({"text": "Session", "probability": 0.99}))
+        "urllib.request.urlopen",
+        return_value=_Response(_body({"text": "Session", "probability": 0.99})),
     ):
         assert purify(CONTENT, QUESTION, _cfg()) == CONTENT
 

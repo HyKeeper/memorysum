@@ -65,6 +65,7 @@
 25. **它唯一可用的能力是 `cite`（定位证据句）**：返回逐字片段 + 字符偏移 + 概率，概率是有效质量信号（>0.9 基本对，<0.3 基本噪声），人工核对 15 题里 10 题完美或相关。已集成成 `evidence_purify`（默认关，见 `core/evidence.py`），机制是给前 N 条记录加 `[Key evidence: …]` 前缀、原文完整保留。**六层失败即原样返回**，其中最关键的一层是"引用必须能在该条原文里逐字找到"——它让幻觉 span 无法进入响应。实测（LoCoMo 4 对话 320 题）：答题准确率 26.9% → 27.8%，+3 题（赢 7 输 4），**McNemar p=0.549 不显著**，收益全部来自 temporal 类。**注意：改 config 打开它必须重启服务才生效**（进程内没有调用代码时改配置无用）。
 26. **LLM judge 的噪声是系统性的，不是随机的**：同一输入重复判 5 次结果稳定，但语义相同的不同表述会判出相反结论（gold=`Oliver, Luna, Bailey` 时 `Luna and Oliver` 判对而 `Oliver and Luna` 判错）——**投票治不了**。必须"规则优先 + LLM 兜底"：gold 是列表就要求元素全中、含数字就要求数字全中并做数字词映射（four→4、twice→2）、明确说不知道直接判错，其余才交给 LLM。规则命中率 85% 时判定才稳定。**代价是绝对数字大降**：同一批题从宽松 LLM judge 的 62.5% 掉到真实的 26.9%，旧的虚高数字不能用来汇报。参考实现见 `/home/rain/bench/judge_v2.py`。
 27. **统计功效**：40 题的 A/B 只能检测 >8% 的效应，"赢 2 输 2"无法区分有无；**+2% 需要约 1500 题**，+5% 需要约 300 题。配对设计看的是"赢/输比例是否显著偏离 1:1"（McNemar），不是净值 —— 即使拿到"赢 10 输 8"也不显著（p≈0.81）。
+28. **rerank 服务的 `-ub` 是隐形上限，压测里的 503 就是它**：`--pooling rank` 让 `slot.can_split()` 为 false，**每对 (query, document) 必须整体进一个物理 batch**，超了 llama.cpp 直接 500：`input (3648 tokens) is too large to process. increase the physical batch size (current batch size: 2048)`。而 `champion-v1.json` 的 `reranker.single_pair_proxy_tokens = 8192` 才是管线以为的上限 → 服务端参数与配置不一致，等于静默丢了能力。2026-10-14 压测：`-ub 2048` + 一条 9050 字符 query（pair 3648 token）→ 失败被重试 23 次、每次卡 3027 ms 后 503。**启动参数必须满足 `-ub ≥ single_pair_proxy_tokens`**（llama.cpp 会把 `-c` 压回模型训练窗口 8192 并告警，所以 8192 就是天花板）；改完实测该请求 200、1.0 s 返回。另：确定性超限**不该重试**，`_post_json` 现在认出三类消息（`too large to process` / `larger than the max context size` / `exceeds the available context size`）即立刻抛 `model_provider_input_too_large`，不再空等 1+2 秒。
 
 ## 本机环境的坑
 
@@ -74,6 +75,7 @@
 - **`pkill -f '<pattern>'` 会杀掉执行它的 shell 自身**（pattern 出现在自己的命令行里，实测 exit 143）→ 用 `ps -eo pid,args | grep -F ... | grep -v grep | awk '{print $1}'` 取 PID，或 `pkill -x <进程名>`。
 - **后台任务用 `setsid`**：`nohup` 只挡 SIGHUP，工具调用超时的 SIGTERM 会带走子进程。
 - **三种服务都是裸进程**，机器重启不自动恢复（尚无 systemd unit）；memorysum 依赖 7999/7997 可达，否则 Add/Search 返回 503。
+- **读压测/评测日志别用"就近的 http_request 行"配对结构化事件**：Add/Search 的 `api_*` 事件行与 uvicorn 的 `http_request` 行是并发交错的，实测会把 Add 的 payload 配到 Search 的状态码上。**按 `trace_id` 关联**才对（工具：`scripts/extract_loadtest_requests.py`）。另外 `api_*` 事件行只在 `MEMORYSUM_DEBUG` 打开时才写。
 - 数据目录 `data/`、`logs/`、`keys.txt`、`.env` 都在 `.gitignore` 里；`keys.txt` 每行一个裸 Bearer token。
 
 ## 提交约定

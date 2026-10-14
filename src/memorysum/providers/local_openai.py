@@ -13,6 +13,7 @@ response shapes seen in the wild:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -32,6 +33,37 @@ logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 _CONCURRENCY = 8
+
+#: llama.cpp rejects a prompt that does not fit in one physical batch, or in the slot
+#: context, with HTTP 500. The prompt is simply too long for the model - retrying cannot
+#: help, and waiting 1 s + 2 s for the same rejection burns the caller's deadline (measured
+#: on 2026-10-14: every failed Search stalled for 3027 ms and then returned 503).
+#: `reranker -ub` must therefore cover `reranker.single_pair_proxy_tokens` (see README).
+_CAPACITY_ERROR_MARKERS = (
+    "too large to process",
+    "larger than the max context size",
+    "exceeds the available context size",
+)
+
+
+def _error_message(response: httpx.Response, *, limit: int = 200) -> str:
+    """Best-effort read of a provider's error text; never the request payload we sent."""
+    decoded: object = None
+    with contextlib.suppress(ValueError):
+        decoded = response.json()
+    message = ""
+    if isinstance(decoded, dict):
+        error = decoded.get("error", decoded)
+        if isinstance(error, dict):
+            message = str(error.get("message") or "")
+        elif isinstance(error, str):
+            message = error
+        if not message:
+            message = str(decoded.get("message") or "")
+    if not message:
+        with contextlib.suppress(Exception):
+            message = response.text
+    return " ".join(message.split())[:limit]
 
 
 def _post_json(
@@ -67,12 +99,22 @@ def _post_json(
             time.sleep(1 if attempt == 0 else 2)
             continue
 
+        detail = _error_message(response) if response.is_error else ""
+        if response.is_error and any(marker in detail for marker in _CAPACITY_ERROR_MARKERS):
+            # Deterministic rejection: fail immediately instead of retrying a prompt that
+            # no number of attempts can shrink. The message carries the server's own limit.
+            logger.warning("Local %s server rejected an oversized input: %s", what, detail)
+            raise ProviderError(
+                "model_provider_input_too_large",
+                f"The {what} server rejected an input that is too long for the model.",
+                status_code=503,
+            )
         if response.status_code in _RETRYABLE_STATUS and attempt + 1 < attempts:
             time.sleep(1 if attempt == 0 else 2)
             continue
         if response.is_error:
             status = response.status_code
-            logger.warning("Local %s server returned HTTP %d", what, status)
+            logger.warning("Local %s server returned HTTP %d: %s", what, status, detail)
             if status == 429:
                 raise ProviderError(
                     "model_provider_rate_limited",

@@ -283,6 +283,70 @@ def test_provider_factory_serves_local_rerank_endpoint_with_plain_list_response(
     assert calls[1]["body"]["documents"] == ["first"]
 
 
+def test_local_rerank_oversized_input_fails_fast_instead_of_retrying(monkeypatch):
+    """Regression for the 2026-10-14 load test.
+
+    ``bge-reranker-v2-m3`` is served with ``--pooling rank``, so llama.cpp cannot split a
+    prompt across physical batches: a pair that does not fit in ``-ub`` is rejected with
+    HTTP 500. The server's answer is deterministic, so retrying only burns the caller's
+    deadline (measured: every failed Search stalled 3027 ms before returning 503).
+    """
+    monkeypatch.setattr(
+        "memorysum.providers.local_openai.time.sleep",
+        lambda _seconds: pytest.fail("an oversized input must not be retried"),
+    )
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            500,
+            json={
+                "error": {
+                    "code": 500,
+                    "message": "input (3648 tokens) is too large to process. increase the "
+                    "physical batch size (current batch size: 2048)",
+                    "type": "server_error",
+                }
+            },
+        )
+
+    provider = build_provider(
+        _local_runtime(), load_pipeline_config(), transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(ProviderError) as error:
+            provider.rerank("question", ["first"])
+    finally:
+        provider.close()
+
+    assert error.value.code == "model_provider_input_too_large"
+    assert error.value.status_code == 503
+    assert len(calls) == 1
+
+
+def test_local_rerank_transient_server_error_is_still_retried(monkeypatch):
+    """A 5xx without a capacity message stays retryable (slots may be busy)."""
+    monkeypatch.setattr("memorysum.providers.local_openai.time.sleep", lambda _seconds: None)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) < 3:
+            return httpx.Response(500, json={"error": {"message": "slot unavailable"}})
+        return httpx.Response(200, json=[{"index": 0, "score": 0.7}])
+
+    provider = build_provider(
+        _local_runtime(), load_pipeline_config(), transport=httpx.MockTransport(handler)
+    )
+    try:
+        assert provider.rerank("question", ["first"]) == [RerankScore(0, 0.7)]
+    finally:
+        provider.close()
+
+    assert len(calls) == 3
+
+
 def test_embedding_endpoint_follows_the_configured_provider():
     pipeline = load_pipeline_config()
     runtime = _local_runtime()

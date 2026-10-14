@@ -58,7 +58,7 @@ UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple uv pip install -e ".[d
 |---|---|---|---|---|
 | memorysum | 8001 | — | — | `.venv/bin/memorysum` |
 | embedding | 7999 | `Qwen3-Embedding-4B-Q8_0.gguf` | ~8.0 GB | 每次 Add/Search 都调用 |
-| rerank | 7997 | `bge-reranker-v2-m3-f16.gguf` | ~0.9 GB | 每次 Search 调用（`reranker.enabled=true`） |
+| rerank | 7997 | `bge-reranker-v2-m3-f16.gguf` | ~1.0 GB | 每次 Search 调用（`reranker.enabled=true`） |
 
 ```bash
 # embedding（注意：embeddings 模式下 -b 必须等于 -ub，llama.cpp 会强制覆盖并告警）
@@ -66,11 +66,30 @@ llama-server -m /home/rain/model/gguf/Qwen3-Embedding-4B-Q8_0.gguf \
   --embeddings --pooling last -fa on -c 32768 -b 2048 -ub 2048 \
   -ctk q8_0 -ctv q8_0 -ngl 99 --host 127.0.0.1 --port 7999 --alias qwen3-embedding-4b
 
-# rerank
+# rerank（-ub 必须 ≥ champion-v1.json 的 reranker.single_pair_proxy_tokens，见下）
 llama-server -m /home/rain/model/gguf/bge-reranker-v2-m3-f16.gguf \
-  --reranking --pooling rank -fa on -c 8192 -b 8192 -ub 2048 -ngl 99 \
+  --reranking --pooling rank -fa on -c 8192 -b 8192 -ub 8192 -ngl 99 \
   --host 127.0.0.1 --port 7997 --alias bge-reranker-v2-m3
 ```
+
+**rerank 的 `-ub` 不能小于配置里的单对上限**（`reranker.single_pair_proxy_tokens = 8192`）。
+`--pooling rank` 让 llama.cpp 的 `slot.can_split()` 为 false，**每一对 (query, document)
+必须整体塞进一个物理 batch**，否则服务端直接拒绝：
+
+```
+E srv send_error: error: input (3648 tokens) is too large to process.
+                  increase the physical batch size (current batch size: 2048)
+```
+
+2026-10-14 的压测就是踩了这个：`-ub 2048` 而管线允许到 8192，一条 9050 字符的
+query（pair 3648 token）被重试 23 次、每次 3 秒后返回 503；改成 `-ub 8192` 后同一请求
+**200 / 289 ms**。`-c` 也不用开大于 8192——llama.cpp 会把 slot 上下文压回模型训练窗口
+并告警。`-ub 8192` 时 rerank 实例约占 1.0 GB 显存。
+
+残余边界：`single_pair_proxy_tokens` 比的是 tiktoken 估算值，而 llama.cpp 用的是 XLM-R
+的 sentencepiece（实测低估约 3%）。所以「估算 8192、真实 ~8445」这一小段仍会被服务端
+拒绝——这时会立刻返回 503 `model_provider_input_too_large`（不再重试），日志里带服务端
+原话，不会像以前那样空转 3 秒。
 
 模型来源：embedding 是 HF 的 F16 GGUF 经 `llama-quantize ... Q8_0` 转出；rerank 是 `convert_hf_to_gguf.py` 从 `BAAI/bge-reranker-v2-m3` 的 safetensors 转换。两者都放在 `/home/rain/model/gguf/`。
 
