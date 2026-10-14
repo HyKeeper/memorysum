@@ -12,6 +12,8 @@
 
 | config sha256（前 12 位） | 关键开关 | 生效时间（本地） | 备注 |
 |---|---|---|---|
+| `b967d8edfd68` | **按平台预算放开候选**：`ordinary_candidate_groups` 64→100、`pair_proxy_budget` 24000→48000、`output_records` 64→100、`output_tokens` 32768→65536 | 20:35 | **第 8 轮配置（未跑分）**：依据是平台文档的 117,760 token 预算 + 大 scope 被 64 组硬截断（`候选 184 / 组 64`）。本地 txt_all 47→48、MRR 0.855→0.8677，`ids_all` 持平。预注册见 [round8-prereg.md](round8-prereg.md)。**需要重启才生效** |
+| `f3e18d5da770` | 第 7 轮 `per_source_cap=2` | 19:56 | 平台逐叶子 **0 变动** → 已回滚到 1（`b967d8edfd68` 含此回滚） |
 | `4918b04e1ca3` | 锚点**回滚 `time_anchor_scope=temporal`** + 640 | 18:52 | 第 7 轮单变量：撤掉"锚点全量"（两轮零收益 + 无证据支撑，见 [round7-prereg.md](round7-prereg.md)）。与 18:39 轮的唯一差异 |
 | `def92ae229b1` | **`direct_max_tokens=640`（回滚「截断」假设）** + 锚点 `time_anchor_scope=all` | 17:58 | 删除错误前提「响应受 4096 cl100k 限制」（**我们对其没有任何口径**，见 AGENTS.md 第 37/38 条 + 约定 5）；实测 640 vs 384 条数不变、每条 +34% 文本。**第 6 轮如要跑，与第 5 轮的唯一差异就是这个** |
 | `86ce56024a4f` | 预算 4608 + 锚点 **`time_anchor_scope=all`** | 17:35 | **第 5 轮单变量**：锚点覆盖面从「时间题」扩到「所有题」。预注册见 [round5-prereg.md](round5-prereg.md)（靶子 C1/C2/I1，回归锚点 locomo1） |
