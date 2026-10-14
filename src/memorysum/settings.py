@@ -102,6 +102,21 @@ class RetrievalConfig(FrozenConfig):
     wide: RetrievalModeConfig
 
 
+class EvidencePurifyConfig(FrozenConfig):
+    """Optional THX-01 evidence purification (see core/evidence.py). Off by default."""
+
+    enabled: bool = False
+    endpoint: str = "http://127.0.0.1:8095/v1/decide"
+    #: Only the first N records are considered.
+    max_records: int = 3
+    #: A citation must clear both thresholds to be used.
+    min_probability: float = 0.85
+    min_chars: int = 15
+    #: The state sent to the decision service is truncated to this many characters.
+    max_state_chars: int = 1000
+    timeout_seconds: float = 15.0
+
+
 class GroupConfig(FrozenConfig):
     max_spans: int
     direct_max_tokens: int
@@ -142,6 +157,7 @@ class CapacityConfig(FrozenConfig):
 
 class PipelineConfig(FrozenConfig):
     pipeline_id: str
+    evidence_purify: EvidencePurifyConfig = EvidencePurifyConfig()
     qualification_status: Literal["provisional", "ready"]
     embedding: EmbeddingConfig
     reranker: RerankerConfig

@@ -24,6 +24,7 @@ from memorysum.core.errors import (
     ServiceError,
     StorageError,
 )
+from memorysum.core.evidence import purify
 from memorysum.core.identity import canonical_json, scope_id
 from memorysum.core.metadata import attach_anchor
 from memorysum.core.query_modes import is_context_query, is_wide_query
@@ -255,7 +256,9 @@ class SearchService:
                     entry.pair_proxy_tokens for entry in entries
                 )
                 ranked = self._rank_entries(entries, request.query, options, deadline)
-                response = self._select_output(ranked, request.top_k, mode, question_cost)
+                response = self._select_output(
+                    ranked, request.top_k, mode, question_cost, request.query
+                )
                 diagnostics["returned_records"] = len(response.data)
                 diagnostics["returned_chars"] = sum(len(item.content) for item in response.data)
                 self._database.assert_scope_active(request.user_id)
@@ -307,7 +310,7 @@ class SearchService:
             return response
 
         ranked = self._rank_entries(entries, request.query, options, deadline)
-        response = self._select_output(ranked, request.top_k, mode, question_cost)
+        response = self._select_output(ranked, request.top_k, mode, question_cost, request.query)
         diagnostics["returned_records"] = len(response.data)
         diagnostics["returned_chars"] = sum(len(item.content) for item in response.data)
         self._database.assert_scope_active(request.user_id)
@@ -1157,6 +1160,7 @@ class SearchService:
         top_k: int,
         mode: RetrievalModeConfig,
         question_cost: int,
+        query: str = "",
     ) -> SearchResponse:
         memory_budget = max(
             0,
@@ -1238,6 +1242,13 @@ class SearchService:
             )
             if already_covered:
                 continue
+            purify_config = self._pipeline.evidence_purify
+            if purify_config.enabled and len(selected) < int(purify_config.max_records):
+                # Verified evidence prefix; core/evidence.py fails open on any error so
+                # the record is returned unchanged unless a high-confidence, verbatim
+                # citation was found. Runs after de-dup and coverage so ordering and
+                # budget accounting stay untouched.
+                content = purify(content, query, purify_config)
             cost = reader_token_count(content) + _RENDER_TOKEN_OVERHEAD
             if spent + cost > memory_budget:
                 continue

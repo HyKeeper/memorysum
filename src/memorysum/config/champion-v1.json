@@ -105,5 +105,14 @@
     "scope_retention_days": 30,
     "cleanup_interval_seconds": 3600,
     "wal_autocheckpoint_pages": 1000
+  },
+  "evidence_purify": {
+    "enabled": false,
+    "endpoint": "http://127.0.0.1:8095/v1/decide",
+    "max_records": 3,
+    "min_probability": 0.85,
+    "min_chars": 15,
+    "max_state_chars": 1000,
+    "timeout_seconds": 15.0
   }
 }
