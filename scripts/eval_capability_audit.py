@@ -38,29 +38,19 @@ from memorysum.services.search import SearchService  # noqa: E402
 from memorysum.settings import RuntimeSettings, load_pipeline_config  # noqa: E402
 from memorysum.storage.database import DatabaseManager  # noqa: E402
 
-#: 平台两次跑分里各子能力的百分比（A=13:25 那次 69.05，B=14:27 那次 68.08）。
-PLATFORM = {
-    "A1": (66.67, 66.67),
-    "A2": (100.0, 100.0),
-    "B1": (100.0, 100.0),
-    "B2": (100.0, 100.0),
-    "B4": (100.0, 100.0),
-    "C1": (60.00, 53.33),
-    "C2": (80.00, 60.00),
-    "C3": (100.0, 100.0),
-    "D1": (66.67, 66.67),
-    "D2": (40.00, 40.00),
-    "E1": (100.0, 100.0),
-    "E2": (100.0, 100.0),
-    "E3": (100.0, 100.0),
-    "F1": (0.0, 0.0),
-    "G1": (100.0, 100.0),
-    "G2": (20.00, 20.00),
-    "G4": (50.00, 50.00),
-    "H2": (50.00, 50.00),
-    "I1": (46.43, 46.43),
-    "I2": (50.00, 50.00),
-}
+#: 平台分数从 `backups/platform_tree.json` 读（`fetch_platform_results.py --save-tree` 生成），
+#: 默认最新一轮——不再写死在脚本里（曾写死过 A/B 两轮 69.05/68.08，平台跑到第 8 轮后就过期了）。
+PLATFORM_TREE = Path("backups/platform_tree.json")
+
+
+def load_platform_leaves() -> tuple[dict[str, float], str, float | None]:
+    """返回（叶子名→分数, 轮次 label, 总分）；树不存在时返回空表。"""
+    if not PLATFORM_TREE.exists():
+        return {}, "?", None
+    tree = json.loads(PLATFORM_TREE.read_text(encoding="utf-8"))
+    run = tree["runs"][-1]
+    return run["leaves"], run["label"], run.get("total")
+
 
 #: 题面里的独特片段 → 子能力（推断，按题面家族分组；同族题面共享一条规则）。
 MAP_RULES: tuple[tuple[str, str], ...] = (
@@ -70,6 +60,7 @@ MAP_RULES: tuple[tuple[str, str], ...] = (
     ("2024-01-12记录", "C1"),
     ("Can you list the order in which", "C2"),  # 事件顺序
     ("右膝晨僵时长从最初的10分钟，变化成当前", "C2"),  # 变化/阶段
+    ("When did Caroline go to the LGBTQ", "C1"),  # 时间点回忆（曾漏映射，dump 里显示为 '?'）
     ("camera’s movement", "B2"),  # 因果/中间步骤（镜头→场景含义）
     ("Taken together, Billing", "B1"),  # 跨片段聚合（多次爆发→整体立场）
     ("courtroom demonstration", "B1"),
@@ -219,17 +210,22 @@ def main() -> int:
             f"{('' if verdict is None else str(verdict)):>9}  {query[:44].replace(chr(10), ' ')}{flag}"
         )
 
-    print("\n按能力汇总（平台分数 A→B；我们的证据实体覆盖率）:")
-    print(f"  {'能力':<5}{'平台A':>8}{'平台B':>8}{'题数':>5}{'覆盖率中位':>11}{'差':>7}")
+    print(
+        "\n按能力汇总（平台分数从 backups/platform_tree.json 的最新一轮读；我们的证据实体覆盖率）:"
+    )
+    raw_leaves, run_label, run_total = load_platform_leaves()
+    print(
+        f"  平台对照 = {run_label}（总分 {run_total}）"
+        if raw_leaves
+        else "  （找不到平台树，只列本地覆盖率）"
+    )
+    print(f"  {'能力':<5}{'平台':>8}{'题数':>5}{'覆盖率中位':>11}")
     for capability, rows in sorted(per_capability.items()):
         coverages = sorted(row[1] for row in rows)
         median = coverages[len(coverages) // 2]
-        a, b = PLATFORM.get(capability, (float("nan"), float("nan")))
-        delta = b - a
-        print(
-            f"  {capability:<5}{a:>8.2f}{b:>8.2f}{len(rows):>5}{median * 100:>10.0f}%"
-            f"{('' if not delta else f'{delta:+.2f}'):>7}"
-        )
+        score = raw_leaves.get(capability)
+        shown = f"{score:>8.2f}" if score is not None else f"{'-':>8}"
+        print(f"  {capability:<5}{shown}{len(rows):>5}{median * 100:>10.0f}%")
     return 0
 
 

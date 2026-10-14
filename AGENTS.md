@@ -175,6 +175,19 @@ ids_all 对齐（39/60、0.745），不是质量下滑——详见第 32、33 �
 > ① 它回答"**为什么**某一叶子掉分"（API 只给分数，不给逐题）；② 它是 full 模式（无逐轮 API 对比）
 > 或换 key 后的兜底口径。**实例级结论（哪一道题翻了）仍然只能来自 `qa_feedback`**。
 
+> **本地打分与平台树的接线（2026-10-14 深夜更新）**：
+> `.venv/bin/python scripts/fetch_platform_results.py --save-tree backups/platform_tree.json`
+> 把**全部轮次**落成一棵树（`{"runs":[{label,total,leaves}]}`，平台侧 `streaming.online` /
+> `streaming.intra_transfer` 在生成时归一化为本地的 `I1` / `I2`）。`eval_local_score.py`、
+> `eval_alignment.py`、`eval_capability_audit.py` **默认读这棵树的最新一轮**（`--run <label>` 换轮次），
+> 平台分数不再写死在脚本里。**当前最新一轮 = 23:00 的 74.90**。
+> 本地判定 `backups/round8/local_verdicts_strict.jsonl` 给出 ①证据充分性 81.71 /
+> ②**能力树口径 74.61（差 −0.29）**——两个口径的定义见下文末。
+> **判定的一条硬口径**：离线重放时，scope 里的 `Streaming online QA feedback` /
+> `Streaming intra-transfer train trajectory` 记录是**本轮判分之后**才灌进去的
+> （第 34 条已实测），第 8 轮检索时并不存在 —— 必须当作不存在，否则会把平台的答案
+> 当成我们交出去的证据。`evidence_k60.md` 里第 1 题排首位的 feedback 就是这么回事。
+
 专家不给题集/金答案/评分标准，但我们可以自己闭环：**题面来自我们的 `/search` 日志，
 逐题判定来自平台回灌的 Add（`streaming-online-feedback-v1`，含 qa_id/question/
 predicted_answer/score/method），证据来自我们自己的检索**。
@@ -199,12 +212,16 @@ smoke 的问答对还可能被直接命中。实测平台前 5 轮都是**全新
 .venv/bin/python scripts/extract_loadtest_requests.py <切片> backups/<轮次>/requests.jsonl
 .venv/bin/python scripts/extract_qa_feedback.py <切片> backups/<轮次>/platform_signals.jsonl
 .venv/bin/python scripts/backup_scopes.py backups/<轮次>
+# 0.5) 更新平台树（每跑完一轮平台分先做这个，后续脚本自动对照最新轮）
+.venv/bin/python scripts/fetch_platform_results.py --save-tree backups/platform_tree.json
 # 1) 题+证据 → 2) 机械规则先判 → 3) 人/agent 补余下 → 4) 聚合 → 5) 对齐记账
-.venv/bin/python scripts/dump_question_evidence.py backups/<轮次>/requests.jsonl
+#    重放历史轮次要先把 config 换回当时版本（git show <sha>:src/memorysum/config/champion-v1.json），
+#    跑完恢复；证据 dump 里剔除判分后才灌入的 feedback/trajectory 记录
+.venv/bin/python scripts/dump_question_evidence.py backups/<轮次>/requests.jsonl --out backups/<轮次>/evidence.md
 .venv/bin/python scripts/eval_mechanical_rules.py backups/<轮次>/requests.jsonl --compare <verdicts>
 #  人读 → backups/<轮次>/local_verdicts_strict.jsonl（每题一行 {i,cap,v,blame,note}）
 .venv/bin/python scripts/eval_local_score.py <verdicts>
-.venv/bin/python scripts/eval_alignment.py <verdicts> backups/<轮次>/platform_tree.json --record
+.venv/bin/python scripts/eval_alignment.py <verdicts> --record
 ```
 
 **专家只给 Add + query 也能跑**：`extract_qa_feedback.py` 现在把 /add 里嵌着的三类信号全抽出来

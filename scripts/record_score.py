@@ -70,6 +70,10 @@ def main() -> int:
         type=int,
         help="复用台账里第 N 条（0 起）的环境指纹——用于补录历史轮次，避免把今天的进程状态记到过去",
     )
+    parser.add_argument(
+        "--env-json",
+        help="环境指纹 JSON（字符串或文件路径），优先于 --env-index；用于补录没有现成条目可复用的历史轮次",
+    )
     args = parser.parse_args()
 
     head = run("git", "rev-parse", "HEAD")
@@ -108,11 +112,13 @@ def main() -> int:
                         100.0 * sum(values) / len(values) - platform_leaves[leaf], 2
                     )
             # 能力树口径：我们实测的叶子 + 观测不到的叶子（按平台该轮值代入，跨轮极稳）。
-            # 平台的总分≈其叶子均值（实测 ±1.2），所以这个口径才是能和他们对话的数字；
-            # 而按题等权的那个只是"证据充分性"上界（2026-10-14 实测偏高 8 分）。
+            # 平台的总分≈其 20 个子能力叶子的均值（实测 ±1.2），所以这个口径才是能和他们
+            # 对话的数字；按题等权的那个只是"证据充分性"上界（2026-10-14 实测偏高 8 分）。
+            # 注意只数叶子（len>1），别把 A-I 父能力也混进均值。
             for leaf, value in platform_leaves.items():
                 merged.setdefault(leaf, value)
-            tree_score = round(sum(merged.values()) / len(merged), 2)
+            leaf_names = [name for name in merged if len(name) > 1]
+            tree_score = round(sum(merged[name] for name in leaf_names) / len(leaf_names), 2)
 
     entry = {
         "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -138,19 +144,27 @@ def main() -> int:
     }
 
     history = json.loads(SCORES.read_text(encoding="utf-8")) if SCORES.exists() else []
-    if args.env_index is not None:
+    env_fields = (
+        "git_head",
+        "git_head_subject",
+        "src_tree",
+        "last_src_commit",
+        "service",
+        "service_started",
+        "rerank_server",
+        "embedding_server",
+        "config_sha256",
+    )
+    if args.env_json:
+        raw = args.env_json
+        payload = json.loads(Path(raw).read_text(encoding="utf-8") if Path(raw).exists() else raw)
+        for field in env_fields:
+            if field in payload:
+                entry[field] = payload[field]
+        entry["env_note"] = payload.get("note", "由 --env-json 指定")
+    elif args.env_index is not None:
         source = history[args.env_index]
-        for field in (
-            "git_head",
-            "git_head_subject",
-            "src_tree",
-            "last_src_commit",
-            "service",
-            "service_started",
-            "rerank_server",
-            "embedding_server",
-            "config_sha256",
-        ):
+        for field in env_fields:
             if field in source:
                 entry[field] = source[field]
         entry["env_reused_from"] = source["round"]
@@ -167,12 +181,14 @@ def main() -> int:
         )
     ub_match = re.search(r"-ub (\d+)", entry["rerank_server"])
     rerank_ub = ub_match.group(1) if ub_match else "—"
+    # 注意用 entry 里的字段（补录历史轮次时它们可能由 --env-json / --env-index 覆盖），
+    # 不要用局部变量——那会把「今天的进程启动时间」写进历史行。
     row = (
         f"| {args.round} | **{args.total:.2f}** | "
         f"{'' if local_score is None else f'{local_score:.2f}'} | "
         f"{'' if tree_score is None else f'{tree_score:.2f}'} | "
         f"{'' if tree_score is None else f'{tree_score - args.total:+.2f}'} | "
-        f"{entry['deployed_src']} | {service_started or '—'} | {rerank_ub or '—'} | "
+        f"{entry['deployed_src']} | {entry.get('service_started') or '—'} | {rerank_ub} | "
         f"`{args.data or '—'}` |\n"
     )
     with LEDGER.open("a", encoding="utf-8") as handle:
