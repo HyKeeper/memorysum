@@ -146,6 +146,15 @@ smoke 的问答对还可能被直接命中。实测平台前 5 轮都是**全新
 `qa_feedback`（逐题判定）、`trajectory`（ALF/DB 流式任务的平台自评 `task_index`+`score`）。
 实测每轮 4 条判定 + 2 条任务自评 + 11 个赛道标签，**不需要专家额外导出任何东西**。
 
+**赛道标签可以连到题面上**（`scripts/map_suites.py`）：`suite` 信号带 `session_id` → 该 session
+的 /add 带 `user_id` → 该 scope 的 `/search` 就是属于这个赛道的题。第 5 轮实测能定位 41 题里的
+**18 题**（其余 23 题没有标签，家族只能按题面推断）。已知定位包括：`tempreason` = 1 道 as-of
+题（党派归属，名字直指 C 家族）、`memtrapbench` = “Reach 24” + NTSB（陷阱/干扰家族）、
+`mquake_remastered` = Dune 音乐类型（UPDATE 覆盖对）、`angry` = 12 Angry Men 剧本（3 题）、
+`locomo_refined` = Caroline（2 题）、`personamem_v2_32k` = 两道个性化题、`beam_100k` = API key +
+实现顺序题、`docpp`/`clbench_*` = 文档 grounded 题。**这是被动观测（约定 5）下能拿到的最好的
+“题→家族”证据**，比按题面猜可靠。
+
 **跨轮对接的两个坑（2026-10-14 实测踩到）**：
 
 - **题面顺序每轮会被打乱**：三轮的 41 个题面集合完全相同，但出现顺序不同。判定文件若按
