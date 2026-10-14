@@ -12,6 +12,7 @@
 
 | config sha256（前 12 位） | 关键开关 | 生效时间（本地） | 备注 |
 |---|---|---|---|
+| `23e18c4ad423` | **第 9 轮**：`rrf_k` 60→**20** + `rrf_k_adaptive=true`（候选数自适应）；叠加第 8 轮的候选预算放开与 422 修复 | 2026-10-15 | **未跑分**。本地 `txt_all 49/60`、`MRR 0.8779`（历史 47 / 0.855），两次独立跑数字相同，split-half 24/25。预注册见 [round9-prereg.md](round9-prereg.md) |
 | `b967d8edfd68` | **按平台预算放开候选**：`ordinary_candidate_groups` 64→100、`pair_proxy_budget` 24000→48000、`output_records` 64→100、`output_tokens` 32768→65536 | 20:35 | **第 8 轮配置（未跑分）**：依据是平台文档的 117,760 token 预算 + 大 scope 被 64 组硬截断（`候选 184 / 组 64`）。本地 txt_all 47→48、MRR 0.855→0.8677，`ids_all` 持平。预注册见 [round8-prereg.md](round8-prereg.md)。**需要重启才生效** |
 | `f3e18d5da770` | 第 7 轮 `per_source_cap=2` | 19:56 | 平台逐叶子 **0 变动** → 已回滚到 1（`b967d8edfd68` 含此回滚） |
 | `4918b04e1ca3` | 锚点**回滚 `time_anchor_scope=temporal`** + 640 | 18:52 | 第 7 轮单变量：撤掉"锚点全量"（两轮零收益 + 无证据支撑，见 [round7-prereg.md](round7-prereg.md)）。与 18:39 轮的唯一差异 |
