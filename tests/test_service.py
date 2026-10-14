@@ -615,3 +615,49 @@ def test_cluster_header_ids_reach_the_response_and_survive_the_v4_backfill(tmp_p
     connection = sqlite3.connect(scope_file)
     assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     connection.close()
+
+
+def test_time_anchor_is_added_only_for_temporal_questions_and_only_when_enabled(tmp_path):
+    """时间类问题的正文必须能读到绝对时间，否则"yesterday"无法解析。
+
+    平台侧证据：`locomo1`（问失业时间）答题模型答 "Yesterday."，被判 0.0 —— 正文里只有
+    相对时间。绝对时间一直在 `created_at` 字段里，但只读正文的模型看不到。这里补一行
+    平台保留形态的锚点，默认关闭、且只对时间/顺序类问题生效（其余题保持逐字原文）。
+    """
+    payload = {
+        "request_id": "add-anchor",
+        "user_id": "anchor-user",
+        "session_id": "session-1",
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": 1706227200000,  # 2024-01-26T00:00:00Z
+                "content": "[locomo_refined][session_3][D3:7][text] Caroline: I went yesterday. I prefer tea.",
+            }
+        ],
+    }
+
+    def search(app, query):
+        with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+            assert client.post("/add", json=payload).status_code == 200
+            body = client.post(
+                "/search", json={"query": query, "user_id": "anchor-user", "top_k": 3}
+            ).json()
+        return " ".join(body["data"][0]["content"].split())
+
+    off = search(make_app(tmp_path / "a", FakeProvider()), "When did Caroline go?")
+    assert "26 Jan, 2024" not in off  # 默认关闭：逐字原文
+    assert off.startswith("[locomo_refined]")
+
+    on_app = make_app(
+        tmp_path / "b", FakeProvider(), groups_overrides={"time_anchor_in_text": True}
+    )
+    on = search(on_app, "When did Caroline go?")
+    assert on.startswith("Session 3 (26 Jan, 2024)"), on
+    assert "D3:7" in on, "原文切片必须保留"
+
+    non_temporal = search(
+        make_app(tmp_path / "c", FakeProvider(), groups_overrides={"time_anchor_in_text": True}),
+        "What does Caroline prefer to drink?",
+    )
+    assert "26 Jan, 2024" not in non_temporal, "非时间类问题不该被加锚点"

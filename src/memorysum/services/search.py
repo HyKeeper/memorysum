@@ -26,8 +26,13 @@ from memorysum.core.errors import (
 )
 from memorysum.core.evidence import purify
 from memorysum.core.identity import canonical_json, scope_id
-from memorysum.core.metadata import attach_anchor
-from memorysum.core.query_modes import is_context_query, is_wide_query
+from memorysum.core.metadata import (
+    attach_anchor,
+    cluster_session,
+    has_visible_date,
+    time_anchor_line,
+)
+from memorysum.core.query_modes import is_context_query, is_temporal_query, is_wide_query
 from memorysum.core.ranking import FusedCandidate, reciprocal_rank_fusion
 from memorysum.core.rendering import (
     _RESPONSE_SPAN_SEPARATOR,
@@ -91,6 +96,9 @@ class RerankEntry:
     source_ids: tuple[str, ...] = ()
     #: Time anchor to re-attach when the rendered slice does not contain it.
     anchor: str | None = None
+    #: Session label from the platform's bracket header (`[..][session_1][D1:3][..]`),
+    #: used when synthesising a visible time anchor for temporal questions.
+    session: str | None = None
 
 
 _SPEAKER_RE = re.compile(r"(?m)^([A-Z][a-z]{2,15}):\s")
@@ -486,6 +494,7 @@ class SearchService:
                     pair_proxy_tokens=pair_cost,
                     source_ids=source_ids,
                     anchor=anchor,
+                    session=cluster_session(str(message["raw_content"])),
                 )
             )
             spent += pair_cost
@@ -988,6 +997,7 @@ class SearchService:
                     pair_proxy_tokens=pair_cost,
                     source_ids=entry_provenance(source_spans)[0],
                     anchor=entry_provenance(source_spans)[1],
+                    session=cluster_session(str(group.row.get("raw_content") or "")),
                 )
 
         ordered = sorted(
@@ -1242,6 +1252,14 @@ class SearchService:
             # text such as "Session 1 (1:56 pm on 8 May, 2023)" — never a
             # "Time: " prefix, which the platform strips from the response text.
             content = attach_anchor(entry.response_content, entry.anchor)
+            if self._pipeline.groups.time_anchor_in_text and is_temporal_query(query):
+                anchor_line = time_anchor_line(
+                    timestamp_ms=entry.created_at_ms,
+                    session=entry.session,
+                    template=self._pipeline.groups.time_anchor_template,
+                )
+                if anchor_line and anchor_line not in content and not has_visible_date(content):
+                    content = f"{anchor_line}\n{content}"
             if self._pipeline.groups.normalize_whitespace:
                 # 默认关闭：原文保真要求正文是原文切片。实测只省 0~1.4% token
                 # （XLM-R 口径 0%），仅用于平台侧 A/B。见 core/text.collapse_whitespace。

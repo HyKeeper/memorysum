@@ -162,3 +162,51 @@ def attach_anchor(content: str, anchor: str | None) -> str:
     if anchor in content:
         return content
     return f"{anchor}\n{content}"
+
+
+_SESSION_RE = re.compile(r"^\s*\[[^\[\]]{1,64}\]\[session_(?P<number>\d+)\]")
+#: 正文里"看得见"的绝对日期：ISO、`8 May, 2023`、`May 8, 2023`、`2024年1月17日`、裸年份。
+#: `[Time: …]` 段落先剔除——AGENTS.md 记录平台会删掉 `Time:` 前缀行，所以它不算。
+_TIME_TAG_RE = re.compile(r"\[Time:[^\]]*\]", re.IGNORECASE)
+_VISIBLE_DATE_RE = re.compile(
+    r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b"
+    r"|\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*,?\s+(?:19|20)\d{2}\b"
+    r"|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+(?:19|20)\d{2}\b"
+    r"|\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
+    r"|\b(?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+
+
+def cluster_session(content: str) -> str | None:
+    """界方括号簇头里的 session 号（`[locomo_refined][session_1][D1:3][text]` → `1`）。"""
+    match = _SESSION_RE.match(content.lstrip())
+    return match.group("number") if match else None
+
+
+def has_visible_date(content: str) -> bool:
+    """正文里是否有"平台不会删掉"的绝对时间（`Time:` 标记不算）。"""
+    return bool(_VISIBLE_DATE_RE.search(_TIME_TAG_RE.sub(" ", content)))
+
+
+def time_anchor_line(*, timestamp_ms: int | None, session: str | None, template: str) -> str | None:
+    """按平台保留的锚点形态合成一行时间（默认 `Session 1 (17 Jan, 2024)`）。
+
+    AGENTS.md 第 9 条：锚点要原样返回，**不能加 `Time:` 前缀**（平台会删掉该行）。
+    这里沿用平台自己的锚点形状 `Session N (…)`，日期取消息的时间戳。
+    """
+    if timestamp_ms is None:
+        return None
+    from datetime import UTC, datetime
+
+    try:
+        moment = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    line = template.format(session=session or "", date=moment.strftime("%d %b, %Y"))
+    line = re.sub(r"\(\s+", "(", line)
+    line = re.sub(r"\s+\)", ")", line)
+    if not session:
+        # 没有 session 号（消息头里没有 `[..][session_N][..]`）时不要留一个空壳
+        line = re.sub(r"\bSession\s+(?=\()", "", line)
+    return " ".join(line.split()).strip()

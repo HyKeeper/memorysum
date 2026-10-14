@@ -137,6 +137,10 @@ class GroupConfig(FrozenConfig):
     #: 原文保真约定要求正文是原文切片；实测该压缩只省 0~1.4% token（XLM-R 口径 0%），
     #: 仅在明确要做平台侧 A/B 时打开。见 core/text.collapse_whitespace。
     normalize_whitespace: bool = False
+    #: 正文里没有"看得见"的绝对时间时，是否按平台保留的锚点形态补一行
+    #: `Session 1 (17 Jan, 2024)`（默认关闭；`Time:` 前缀会被平台删掉，所以不用那种）。
+    time_anchor_in_text: bool = False
+    time_anchor_template: str = "Session {session} ({date})"
 
 
 class CoverageConfig(FrozenConfig):

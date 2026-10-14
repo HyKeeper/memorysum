@@ -56,3 +56,36 @@ def is_personal_query(query: str) -> bool:
         term in query for term in _PREFERENCE_CHINESE
     )
     return first_person and preference
+
+
+#: 时间/顺序类问题：这些题必须能在正文里读到绝对时间，否则"昨天/半个月前"无法解析，
+#: 而平台记录的平台侧证据是：`locomo1` 问失业时间，答题模型答 "Yesterday."，被判 0.0。
+_TEMPORAL_ENGLISH = re.compile(
+    r"\b(?:when|what (?:year|date|day|time)|which (?:year|date|day)|how long|how many "
+    r"(?:minutes|hours|days|weeks|months|years)|order|before|after|earlier|later|as of|"
+    r"by when|since|duration|interval)\b",
+    re.IGNORECASE,
+)
+_TEMPORAL_CHINESE = (
+    "什么时候",
+    "何时",
+    "哪一年",
+    "哪一天",
+    "几号",
+    "多久",
+    "多长时间",
+    "顺序",
+    "先后",
+    "之前",
+    "之后",
+    "变化成",
+    "从最初",
+    "现在是多少",
+    "复查",
+    "记录的",
+    "当时",
+)
+
+
+def is_temporal_query(query: str) -> bool:
+    return bool(_TEMPORAL_ENGLISH.search(query)) or any(term in query for term in _TEMPORAL_CHINESE)
