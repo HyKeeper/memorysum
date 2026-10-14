@@ -48,7 +48,12 @@ class RerankerConfig(FrozenConfig):
     provider: str
     model: str
     instruction: str
+    #: 单条 (query, document) 的代理 token 预算（cl100k 估算值）。必须是**保守值**：
+    #: 真实口径是 llama.cpp 的 XLM-R 分词器，实测最坏 real/est = 1.494，所以预算×1.75
+    #: 仍小于服务端硬上限（模型训练窗口 8192）才算安全。见 README「服务编排」。
     single_pair_proxy_tokens: int
+    #: query(+options) 的代理 token 上限，超过直接 422；目前只作为荒谬输入的护栏。
+    max_query_proxy_tokens: int
     ordinary_pair_proxy_budget: int
     wide_pair_proxy_budget: int
     ordinary_candidate_groups: int

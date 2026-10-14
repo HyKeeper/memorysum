@@ -213,7 +213,7 @@ class SearchService:
         rerank_query_cost = reader_token_count(
             self._pipeline.reranker.instruction + "\n" + question_text
         )
-        if rerank_query_cost > 6144:
+        if rerank_query_cost > self._pipeline.reranker.max_query_proxy_tokens:
             raise ServiceError(
                 "query_options_too_large",
                 "The query and options exceed the configured reranker input limit.",
@@ -303,8 +303,34 @@ class SearchService:
         diagnostics["rerank_groups"] = len(entries)
         diagnostics["rerank_pair_tokens_est"] = sum(entry.pair_proxy_tokens for entry in entries)
         if not entries:
-            diagnostics["returned_records"] = 0
-            response = SearchResponse(data=[])
+            if not fused:
+                diagnostics["returned_records"] = 0
+                response = SearchResponse(data=[])
+                self._database.assert_scope_active(request.user_id)
+                self._results.set(result_cache_key, response)
+                return response
+            # Every candidate pair is over the rerank budget, so nothing can be scored.
+            # Returning `data=[]` would tell the caller "no relevant memory" when the
+            # evidence is right there, so fall back to the fusion order (the same ranking
+            # the pipeline uses with `reranker.enabled=false`). The strategy string and the
+            # warning keep the skipped rerank visible in the audit log.
+            logger.warning(
+                "No rerankable pair in scope %s (query %d proxy tokens > budget %d)",
+                reference.scope_key[:12],
+                rerank_query_cost,
+                self._pipeline.reranker.single_pair_proxy_tokens,
+            )
+            diagnostics["strategy"] = "hybrid_retrieval_unreranked"
+            diagnostics["reranked"] = False
+            entries = self._prepare_rerank_entries(
+                fused, rows, request, options, wide_mode, enforce_pair_limits=False
+            )
+            ranked = [(entry, entry.candidate.score) for entry in entries]
+            response = self._select_output(
+                ranked, request.top_k, mode, question_cost, request.query
+            )
+            diagnostics["returned_records"] = len(response.data)
+            diagnostics["returned_chars"] = sum(len(item.content) for item in response.data)
             self._database.assert_scope_active(request.user_id)
             self._results.set(result_cache_key, response)
             return response
@@ -912,7 +938,15 @@ class SearchService:
         request: SearchRequest,
         options: Sequence[str],
         wide_mode: bool,
+        *,
+        enforce_pair_limits: bool = True,
     ) -> list[RerankEntry]:
+        """Render candidates into rerank entries.
+
+        `enforce_pair_limits=False` keeps every candidate regardless of the per-pair /
+        total-pair / group budget; that is for the fusion-only fallback, where no rerank
+        request is made and the budgets therefore do not apply.
+        """
         max_groups = (
             self._pipeline.reranker.wide_candidate_groups
             if wide_mode
@@ -963,6 +997,8 @@ class SearchService:
                 entry.candidate.window_id,
             ),
         )
+        if not enforce_pair_limits:
+            return ordered
         selected: list[RerankEntry] = []
         spent = 0
         for entry in ordered:

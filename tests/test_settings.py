@@ -69,3 +69,34 @@ def test_pipeline_falls_back_to_base_weight_for_unlisted_channels():
         assert (
             pipeline.retrieval.channel_weights.get(name, pipeline.retrieval.base_channel_weight) > 0
         )
+
+
+def test_rerank_pair_budget_stays_conservative_under_the_model_window():
+    """Guard the calibration recorded in README「服务拓扑」.
+
+    The per-pair budget is compared against tiktoken's cl100k estimate, but the server
+    counts with the model's own XLM-R tokenizer, which splits English/URL/punctuation text
+    *more* finely. Measured over 1335 real memory chunks plus adversarial samples
+    (2026-10-14, `scripts/calibrate_rerank_tokens.py`): median 1.166, p99 1.357,
+    worst 1.494 real tokens per estimated token. Worse ratios only fail the whole Search,
+    so the budget must keep real tokens under the 8192 token model window with room to
+    spare - here 1.75x, i.e. ~17% beyond the worst ratio ever measured.
+    """
+    from memorysum.settings import load_pipeline_config
+
+    worst_measured_ratio = 1.494
+    tolerated_ratio = 1.75
+    model_window = 8192
+
+    reranker = load_pipeline_config().reranker
+    assert reranker.single_pair_proxy_tokens * worst_measured_ratio <= model_window
+    assert reranker.single_pair_proxy_tokens * tolerated_ratio <= model_window
+
+
+def test_rerank_query_cap_is_configured_and_finite():
+    from memorysum.settings import load_pipeline_config
+
+    reranker = load_pipeline_config().reranker
+    # A long query still needs to fit the rerank budget together with a window's text,
+    # and the response token budget shrinks with the question, so the cap stays finite.
+    assert 0 < reranker.max_query_proxy_tokens <= reranker.ordinary_pair_proxy_budget

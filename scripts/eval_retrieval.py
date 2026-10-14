@@ -9,10 +9,16 @@
 设计要点：
 - **离线运行**：直接实例化 SearchService（读 DB + 调本地模型服务），不经过 HTTP，
   因此不会重启或干扰正在运行的 memorysum。
-- **gold 判定**：返回的原文片段（空白规范化后取前 100 字符）必须是 gold 消息原文的
-  子串——Search 返回的是逐字原文切片，所以这是精确判定，不依赖模糊匹配。
+- **gold 判定**：两个口径一起看。
+  * `txt_all`：返回正文里含有一段 ≥60 字符的 gold 消息原文逐字片段（决定 accuracy 上限）。
+    **不要用"正文头部"做判据**——响应正文允许带渲染前缀（尤其时间锚点），头部不保证
+    与原文相邻；2026-10-14 就因为这个把 38/60 误报成 13/60。
+  * `ids_all`：条目上的 `source_ids` 能定位到 gold（平台的 Recall 口径，取决于入库时
+    是否带 harness 元数据头）。
 - **必须看 split-half**：只报全样本净值会掩盖"两半相抵"的假象（实测纯 rerank 排序
   全样本净 +1，实际两半为 +4 / −3）。
+- **指标失灵与质量下滑要分清**：指标突然腰斩时，先用
+  「检索→融合→精排→输出」四段链路追踪确认 gold 是在哪一段丢的，再决定是改排序还是改度量。
 
 依赖：BEAM exp0 数据已灌入（见 README 的 Add 示例），且本地 embedding(:7999) /
 rerank(:7997) 服务可达。缺 rerank 服务时把 config 的 reranker.enabled 置 false 仍可评测。
@@ -22,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sys
 import time
@@ -175,37 +182,80 @@ def build_service(user_id: str):
     return SearchService(database, provider, pipeline), provider, database
 
 
-def load_gold(database, user_id: str) -> dict[int, str]:
+def load_gold(database, user_id: str) -> dict[int, tuple[str, tuple[str, ...]]]:
     reference = database.resolve_scope(user_id, create=False)
     if reference is None:
         raise SystemExit(
             f"找不到 user_id={user_id} 的 scope；先按 README 的 Add 示例把数据灌进去。"
         )
     connection = database.connect(reference, user_id)
-    rows = connection.execute("select message_id, raw_content from messages").fetchall()
+    rows = connection.execute(
+        "select message_id, raw_content, metadata_ids from messages"
+    ).fetchall()
     connection.close()
-    return {int(r["message_id"]): normalise(str(r["raw_content"])) for r in rows}
+    gold: dict[int, tuple[str, tuple[str, ...]]] = {}
+    for row in rows:
+        raw = row["metadata_ids"]
+        try:
+            ids = tuple(json.loads(raw)) if raw else ()
+        except (TypeError, ValueError):
+            ids = ()
+        gold[int(row["message_id"])] = (normalise(str(row["raw_content"])), ids)
+    return gold
 
 
-def evaluate(service, user_id: str, gold: dict[int, str], dump: bool) -> tuple[list, list]:
-    ranks, latencies = [], []
+#: 判定"这条就是 gold 消息"所需的逐字片段长度。取 60 是为了短窗口也能判，
+#: 同时远大于任何渲染前缀（锚点 ≈35 字符），不会把前缀误当成正文。
+_VERBATIM_RUN = 60
+
+
+def contains_verbatim(text: str, target: str, run: int = _VERBATIM_RUN) -> bool:
+    """返回正文里是否含有一段 ≥`run` 字符的 gold 原文逐字片段。
+
+    **不要用"正文头部"做判据。** 响应正文允许带渲染前缀——尤其是时间锚点
+    （`Session 1 (1:56 pm on 8 May, 2023)`，AGENTS.md 第 9 条要求原样返回）：
+    锚点要么本来就在窗口切片里，要么在渲染时被重新贴到正文最前面，两种情况
+    下正文头部都不保证与原文相邻。2026-10-14 实测：锚点上线后"头部"判据把
+    top-1 从 38/60 砸到 13/60，而链路追踪显示 gold 在检索/融合/精排里依旧
+    是第 1 名——纯粹是度量被前缀骗了。
+    """
+    if not target:
+        return False
+    if len(text) < run:
+        return bool(text) and text in target
+    for start in range(0, len(text) - run + 1, 10):
+        if text[start : start + run] in target:
+            return True
+    return False
+
+
+def ids_hit(item, gold_ids: tuple[str, ...]) -> bool:
+    """平台的 Recall 口径：条目上的 id 能否定位到 gold（AGENTS.md 第 9 条）。"""
+    return bool(gold_ids) and bool(set(item.source_ids or ()) & set(gold_ids))
+
+
+def evaluate(service, user_id: str, gold, dump: bool) -> tuple[list, list, list]:
+    ranks, id_ranks, latencies = [], [], []
     for query, gold_id, _marker in CASES:
         started = time.perf_counter()
         response = service.search(SearchRequest(query=query, user_id=user_id, top_k=10))
         latencies.append(time.perf_counter() - started)
-        target = gold.get(gold_id, "")
+        target, gold_ids = gold.get(gold_id, ("", ()))
         rank = None
+        id_rank = None
         for index, item in enumerate(response.data, start=1):
-            head = normalise(item.content)[:100]
-            if head and head in target:
+            if rank is None and contains_verbatim(normalise(item.content), target):
                 rank = index
-                break
+            if id_rank is None and ids_hit(item, gold_ids):
+                id_rank = index
         ranks.append(rank)
+        id_ranks.append(id_rank)
         if dump:
             print(
-                f"    {'OK  ' if rank == 1 else (f'@{rank:<3d}' if rank else 'MISS ')} {query[:66]}"
+                f"    {'OK  ' if rank == 1 else (f'@{rank:<3d}' if rank else 'MISS')} "
+                f"ids={'OK' if id_rank == 1 else (id_rank or 'MISS')!s:<5} {query[:60]}"
             )
-    return ranks, latencies
+    return ranks, id_ranks, latencies
 
 
 def metrics(ranks: list) -> tuple[int, int, float]:
@@ -237,24 +287,40 @@ def main() -> None:
     try:
         gold = load_gold(database, args.user_id)
         started = time.perf_counter()
-        ranks, latencies = evaluate(service, args.user_id, gold, args.dump_rank)
+        ranks, id_ranks, latencies = evaluate(service, args.user_id, gold, args.dump_rank)
         elapsed = time.perf_counter() - started
     finally:
         provider.close()
 
     top1, top3, mrr = metrics(ranks)
     print(
-        f"\ntop1={top1}/{len(CASES)}  top3={top3}/{len(CASES)}  MRR={mrr:.4f}  "
+        f"\ntxt_all（返回正文里含 gold 逐字片段）: top1={top1}/{len(CASES)}  "
+        f"top3={top3}/{len(CASES)}  MRR={mrr:.4f}  "
         f"({elapsed:.0f}s, p50={sorted(latencies)[len(latencies) // 2] * 1000:.0f}ms)"
     )
+    id_top1, id_top3, id_mrr = metrics(id_ranks)
+    if any(rank is not None for rank in id_ranks):
+        print(
+            f"ids_all（条目上的 id 能定位到 gold，平台的 Recall 口径）: "
+            f"top1={id_top1}/{len(CASES)}  top3={id_top3}/{len(CASES)}  MRR={id_mrr:.4f}"
+        )
+    else:
+        print("ids_all: 该 scope 没有 harness 元数据头（META），无法用 id 口径判定")
 
     if args.no_split_half:
         return
     half = len(ranks) // 2
     print("\nsplit-half（只报全样本净值会被两半相抵的假象骗到）:")
-    for label, part in (("前半", ranks[:half]), ("后半", ranks[half:])):
+    for label, part, id_part in (
+        ("前半", ranks[:half], id_ranks[:half]),
+        ("后半", ranks[half:], id_ranks[half:]),
+    ):
         a, b, c = metrics(part)
-        print(f"  {label}  top1={a}/{len(part)}  top3={b}/{len(part)}  MRR={c:.4f}")
+        d, e, _f = metrics(id_part)
+        print(
+            f"  {label}  txt_all top1={a}/{len(part)}  top3={b}/{len(part)}  MRR={c:.4f}"
+            f"   |  ids_all top1={d}/{len(part)}  top3={e}/{len(part)}"
+        )
 
 
 if __name__ == "__main__":

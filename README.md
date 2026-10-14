@@ -19,7 +19,11 @@
 >
 > **schema v3 就地迁移**：老 scope 在首次打开时自动补上 `metadata_ids` / `metadata_anchor` 两列并从原文回填，**无需重建数据**（`database.py:_migrate_v2_to_v3`，幂等，中断后可重试）。
 
-> **检索质量怎么量（2026-10-13 建立）**：`scripts/eval_locomo.py` 用 LoCoMo 官方标注（`locomo10.json` 的 question / answer / evidence / category）对已灌入的 scope 打分，离线跑 SearchService，不影响线上服务。两个口径一起看：**`ids_all`**（返回项的 `source_ids` 覆盖 gold evidence 的比例，即平台的 Recall 口径）和 **`txt_all`**（gold turn 原文真的出现在返回正文里，决定 accuracy 上限）——两者之差就是 chunk 级 id 粒度掩盖的部分。`--budgets 0,4096,8192` 模拟平台按 token 截断：**条目更大和条目更多在预算内互斥**，`groups.direct_max_tokens` 从 640 降到 384 能让 4096 预算多塞 5 条记录（ids_all 86.7%→90.7%），但不截断时反而少给内容。改任何排序参数都要做 **split-half** 和 **跨对话交叉验证**（用 `locomo10.json` 按 `[LOCOMO_META chunk_id=… source_ids=…]` 格式自建 scope 灌入即可）。
+> **检索质量怎么量（2026-10-13 建立，2026-10-14 修判据）**：`scripts/eval_locomo.py` 用 LoCoMo 官方标注（`locomo10.json` 的 question / answer / evidence / category）对已灌入的 scope 打分，离线跑 SearchService，不影响线上服务。两个口径一起看：**`ids_all`**（返回项的 `source_ids` 覆盖 gold evidence 的比例，即平台的 Recall 口径）和 **`txt_all`**（gold turn 原文真的出现在返回正文里，决定 accuracy 上限）——两者之差就是 chunk 级 id 粒度掩盖的部分（BEAM 上实测 39/60 vs 47/60，差的那些是没带 META 头的消息）。
+>
+> **判据不要绑在正文头部**：响应正文允许带渲染前缀（尤其时间锚点，见 AGENTS.md 第 9 条），所以 `txt_all` 用「正文里含 ≥60 字符 gold 逐字片段」而不是「前 100 字符」。实测教训：锚点上线后旧判据把 BEAM 的 top-1 从 38/60 砸到 13/60，而精排名次根本没变（`attach_anchor` 改成恒等即回到 0.718 MRR）。指标异常时先做「检索→融合→精排→输出」四段链路追踪，再决定改排序还是改度量。
+>
+> `--budgets 0,4096,8192` 模拟平台按 token 截断：**条目更大和条目更多在预算内互斥**，`groups.direct_max_tokens` 从 640 降到 384 能让 4096 预算多塞 5 条记录（ids_all 86.7%→90.7%），但不截断时反而少给内容。改任何排序参数都要做 **split-half** 和 **跨对话交叉验证**（用 `locomo10.json` 按 `[LOCOMO_META chunk_id=… source_ids=…]` 格式自建 scope 灌入即可）。
 >
 > **本轮结论**：唯一经三折验证的改进是 `retrieval.per_source_cap = 1`（每个 chunk 最多返回 1 条，避免一个话多的 chunk 占满 top-k，给多跳题的第二处证据腾位置），三对话 ids_all +2.5 / 0 / +0.7pp，无负向。相似度分数加权、chunk 共识投票、说话人加权、邻居扩展、规则式多查询扩展均已实现但**默认关闭**——它们只在 80 题小样本上有效，全量或跨对话后回到噪声甚至转负；把 `context_dense` 权重上调到 2.0 属于典型的单对话过拟合（conv-26 +3.8pp，conv-30 −1.2pp），已回滚。
 
@@ -72,7 +76,24 @@ llama-server -m /home/rain/model/gguf/bge-reranker-v2-m3-f16.gguf \
   --host 127.0.0.1 --port 7997 --alias bge-reranker-v2-m3
 ```
 
-**rerank 的 `-ub` 不能小于配置里的单对上限**（`reranker.single_pair_proxy_tokens = 8192`）。
+**rerank 的 `-ub` 必须覆盖「最坏情况下真的会送进来的 pair 长度」**，而配置里的
+`reranker.single_pair_proxy_tokens = 4608` 只是**代理估算预算**，两者关系靠标定维系：
+
+| 量 | 值 | 来源 |
+|---|---|---|
+| 模型窗口 = `-c/-ub` 实际天花板 | 8192 | `bge-reranker-v2-m3` 训练窗口（llama.cpp 会把更大的 `-c` 压回来并告警） |
+| 单对代理预算 | 4608 | `champion-v1.json`，比的是 `reader_token_count()`（tiktoken cl100k） |
+| 估值的低估倍率 real/est | 中位 1.166 / p99 1.357 / **最坏 1.479** | 1330 条真实 memory + 对抗样本，`scripts/calibrate_rerank_tokens.py` |
+| 预算顶格时的真实长度 | 4608 × 1.479 ≈ **6814** | 离窗口还有 17% 余量 |
+
+低估方向很反直觉：**XLM-R 对英文/URL/标点切得比 cl100k 更碎**（URL/UUID 1.479、标点密集
+1.334、英文散文 1.17），而中日韩俄阿都小于 0.7（中文 0.57）。所以预算是按英文那侧留的。
+改模型或换 tokenizer 后重跑标定脚本，它会在不安全时以非 0 退出。
+
+为什么服务端不跟着改小显存：`-ub` 已经贴着模型窗口（8192），再小就重新出现
+「客户端以为能发、服务端收不了」的悬崖；再大也没用（slot 上下文会被压回 8192，实测
+`-ub 16384` 只多占 576 MB）。当前 rerank 实例 1046 MB，全卡 9.1/16.3 GB。
+
 `--pooling rank` 让 llama.cpp 的 `slot.can_split()` 为 false，**每一对 (query, document)
 必须整体塞进一个物理 batch**，否则服务端直接拒绝：
 
@@ -81,15 +102,22 @@ E srv send_error: error: input (3648 tokens) is too large to process.
                   increase the physical batch size (current batch size: 2048)
 ```
 
-2026-10-14 的压测就是踩了这个：`-ub 2048` 而管线允许到 8192，一条 9050 字符的
+2026-10-14 的压测就是踩了这个：`-ub 2048` 而那时的预算写着 8192，一条 9050 字符的
 query（pair 3648 token）被重试 23 次、每次 3 秒后返回 503；改成 `-ub 8192` 后同一请求
-**200 / 289 ms**。`-c` 也不用开大于 8192——llama.cpp 会把 slot 上下文压回模型训练窗口
-并告警。`-ub 8192` 时 rerank 实例约占 1.0 GB 显存。
+**200 / 289 ms**。
 
-残余边界：`single_pair_proxy_tokens` 比的是 tiktoken 估算值，而 llama.cpp 用的是 XLM-R
-的 sentencepiece（实测低估约 3%）。所以「估算 8192、真实 ~8445」这一小段仍会被服务端
-拒绝——这时会立刻返回 503 `model_provider_input_too_large`（不再重试），日志里带服务端
-原话，不会像以前那样空转 3 秒。
+两道保险：
+
+1. **预算留余量**（上表），超预算的候选不进 rerank；
+2. 万一还是被服务端拒（换模型、标定失效），`_post_json` 会立刻抛
+   `model_provider_input_too_large` 并把服务端原话记进日志，不再空转 1+2 秒。
+
+并发也不是悬崖：实测 4×3570、6×3570、8×6970 token 并发（合计最高 55.7k token，远超
+8192 的 unified KV）全部 200，只是排队变慢（p50 3.3 s / max 5.8 s）。
+
+如果 query 太长使得**每个**候选 pair 都超预算，Search 不会返回空数组，而是退回融合排序
+（与 `reranker.enabled=false` 同样的排序信号），策略字段记为
+`hybrid_retrieval_unreranked` 并记 WARNING——证据照常返回，只是没有精排。
 
 模型来源：embedding 是 HF 的 F16 GGUF 经 `llama-quantize ... Q8_0` 转出；rerank 是 `convert_hf_to_gguf.py` 从 `BAAI/bge-reranker-v2-m3` 的 safetensors 转换。两者都放在 `/home/rain/model/gguf/`。
 

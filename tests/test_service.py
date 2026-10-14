@@ -59,7 +59,13 @@ class FruitProvider(FakeProvider):
         ]
 
 
-def make_app(data_root: Path, provider: FakeProvider, *, rerank_enabled: bool = True):
+def make_app(
+    data_root: Path,
+    provider: FakeProvider,
+    *,
+    rerank_enabled: bool = True,
+    reranker_overrides: dict | None = None,
+):
     runtime = RuntimeSettings(
         data_root=data_root,
         openrouter_base_url="https://openrouter.ai/api/v1",
@@ -70,9 +76,16 @@ def make_app(data_root: Path, provider: FakeProvider, *, rerank_enabled: bool = 
         port=8001,
     )
     pipeline = load_pipeline_config()
-    if pipeline.reranker.enabled != rerank_enabled:
+    if pipeline.reranker.enabled != rerank_enabled or reranker_overrides:
         pipeline = pipeline.model_copy(
-            update={"reranker": pipeline.reranker.model_copy(update={"enabled": rerank_enabled})}
+            update={
+                "reranker": pipeline.reranker.model_copy(
+                    update={
+                        "enabled": rerank_enabled,
+                        **(reranker_overrides or {}),
+                    }
+                )
+            }
         )
     return create_app(
         runtime=runtime,
@@ -411,3 +424,74 @@ def test_rerank_disabled_skips_provider_and_scores_with_fusion(tmp_path):
     # Scores come from reciprocal-rank fusion, not from a rerank logit, so every
     # value stays far below the [0, 1] range the test provider hands out.
     assert all(0.0 < item["score"] < 0.5 for item in items)
+
+
+def test_long_scope_returns_fusion_order_instead_of_empty_when_no_pair_fits_the_budget(tmp_path):
+    """A pair the reranker cannot score must not turn into "this scope has no memory".
+
+    The pair budget is deliberately conservative (see README「服务拓扑」), so a long query
+    can leave every candidate over it. The pipeline then skips reranking but still returns
+    the fusion-ranked evidence, and says so through the strategy string.
+    """
+    provider = FakeProvider()
+    app = make_app(
+        tmp_path / "data",
+        provider,
+        reranker_overrides={"single_pair_proxy_tokens": 1, "ordinary_pair_candidate_groups": 1}
+        if False
+        else {"single_pair_proxy_tokens": 1},
+    )
+    payload = {
+        "request_id": "add-budget",
+        "user_id": "budget-user",
+        "session_id": "session-1",
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": 1704067200000,
+                "content": "I prefer tea in the morning and coffee in the afternoon. " * 4,
+            }
+        ],
+    }
+
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        assert client.post("/add", json=payload).status_code == 200
+        provider.rerank_batches.clear()
+        searched = client.post(
+            "/search",
+            json={
+                "query": "What do I prefer in the morning?",
+                "user_id": "budget-user",
+                "top_k": 5,
+            },
+        )
+        assert searched.status_code == 200
+        body = searched.json()
+        assert body["data"], "evidence must still come back, not an empty array"
+        assert provider.rerank_batches == [], "no pair fits, so the reranker must not be called"
+
+
+def test_search_reports_the_unreranked_fallback_in_diagnostics(tmp_path, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="memorysum.services.search")
+    provider = FakeProvider()
+    app = make_app(tmp_path / "data", provider, reranker_overrides={"single_pair_proxy_tokens": 1})
+    payload = {
+        "request_id": "add-diag",
+        "user_id": "diag-user",
+        "session_id": "session-1",
+        "messages": [
+            {"role": "user", "timestamp": 1704067200000, "content": "I rate the tea highly."}
+        ],
+    }
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        assert client.post("/add", json=payload).status_code == 200
+        assert (
+            client.post(
+                "/search",
+                json={"query": "What about tea?", "user_id": "diag-user", "top_k": 3},
+            ).status_code
+            == 200
+        )
+    assert any("No rerankable pair" in record.message for record in caplog.records)

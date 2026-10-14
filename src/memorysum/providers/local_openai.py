@@ -38,7 +38,9 @@ _CONCURRENCY = 8
 #: context, with HTTP 500. The prompt is simply too long for the model - retrying cannot
 #: help, and waiting 1 s + 2 s for the same rejection burns the caller's deadline (measured
 #: on 2026-10-14: every failed Search stalled for 3027 ms and then returned 503).
-#: `reranker -ub` must therefore cover `reranker.single_pair_proxy_tokens` (see README).
+#: The pipeline's own budget (`reranker.single_pair_proxy_tokens`) is a *proxy* estimate and
+#: deliberately conservative; `reranker -ub` must cover its worst-case real length (see the
+#: calibration table in README「服务拓扑」).
 _CAPACITY_ERROR_MARKERS = (
     "too large to process",
     "larger than the max context size",
