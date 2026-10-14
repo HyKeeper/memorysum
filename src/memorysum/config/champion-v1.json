@@ -85,7 +85,7 @@
     "tail_cut_chars": 0,
     "normalize_whitespace": false,
     "time_anchor_in_text": true,
-    "time_anchor_scope": "all",
+    "time_anchor_scope": "temporal",
     "time_anchor_template": "Session {session} ({date})"
   },
   "coverage": {
