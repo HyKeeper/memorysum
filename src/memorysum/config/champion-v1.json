@@ -74,7 +74,7 @@
     "similarity_weight": 0.0,
     "consensus_weight": 0.0,
     "speaker_weight": 0.0,
-    "per_source_cap": 1,
+    "per_source_cap": 2,
     "term_coverage_weight": 0.0
   },
   "groups": {
