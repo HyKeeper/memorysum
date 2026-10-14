@@ -84,7 +84,7 @@
     "head_records": 0,
     "tail_cut_chars": 0,
     "normalize_whitespace": false,
-    "time_anchor_in_text": false,
+    "time_anchor_in_text": true,
     "time_anchor_template": "Session {session} ({date})"
   },
   "coverage": {
