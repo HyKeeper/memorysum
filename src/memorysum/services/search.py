@@ -1288,9 +1288,10 @@ class SearchService:
                 and len(selected) >= head_records
                 and len(content) > tail_cut
             ):
-                # Budget-agnostic shape: early records stay complete (they are the
-                # ones a truncating platform is certain to keep), later ones are
-                # trimmed so a token-capped response still fits more of them.
+                # Planned shape: early records stay complete, later ones are trimmed.
+                # Default off — the harness publishes no response-length policy, so
+                # trimming costs content without a measured benefit. Revisit only if
+                # the platform states a cap.
                 content = content[:tail_cut].rstrip()
             content_key = " ".join(content.split()).casefold()
             if content_key in seen_content:

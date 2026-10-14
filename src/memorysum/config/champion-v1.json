@@ -79,7 +79,7 @@
   },
   "groups": {
     "max_spans": 4,
-    "direct_max_tokens": 384,
+    "direct_max_tokens": 640,
     "context_max_tokens": 1536,
     "head_records": 0,
     "tail_cut_chars": 0,
