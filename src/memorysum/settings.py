@@ -60,6 +60,13 @@ class RerankerConfig(FrozenConfig):
     wide_candidate_groups: int
     batch_groups: int
     max_concurrency: int
+    #: rerank 分数量化粒度（0.0 = 关闭）。>0 时把 cross-encoder 分数 round 到该粒度
+    #: 再参与排序：llama.cpp GPU 批推理（连续 batching 混合并发请求）的 run-to-run
+    #: 分数波动实测 ±0.02~0.06，粒度 0.1 可把边缘 pair 的排名抖动吸收成确定性 tie
+    #: （tie-break 走 best_rank/window_id，本身确定）。实测（2026-10-15）：0.1 在两题
+    #: 并发下把 Reach 24 题前 13 位锁死（含 few-shot 示例关键位 6/7），0.05 仍抖、
+    #: ≥0.15 制造过多 tie 反而在别处抖。0.0 保持逐字使用模型返回分数。
+    score_quantization: float = 0.0
 
 
 class RetrievalModeConfig(FrozenConfig):

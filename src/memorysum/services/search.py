@@ -199,7 +199,7 @@ def _merge_ranked(
                 continue
             seen.add(entry.view_id)
             tail.append((entry, score))
-        tail.sort(key=lambda item: (-item[1], item[0].candidate.best_rank, item[0].view_id))
+        tail.sort(key=lambda item: (-item[1], item[0].candidate.best_rank, _content_key(item[0])))
         return list(base) + tail
 
     seen = set()
@@ -209,7 +209,7 @@ def _merge_ranked(
             continue
         seen.add(entry.view_id)
         merged.append((entry, score))
-    merged.sort(key=lambda item: (-item[1], item[0].candidate.best_rank, item[0].view_id))
+    merged.sort(key=lambda item: (-item[1], item[0].candidate.best_rank, _content_key(item[0])))
     return merged
 
 
@@ -261,6 +261,20 @@ class CandidateGroup:
     candidate: FusedCandidate
     row: dict[str, object]
     contains_context_window: bool
+
+
+def _content_key(entry) -> bytes:
+    """跨轮稳定的排序 tie-break 键：响应正文的摘要。
+
+    view_id / window_id 都派生自 user_id / request_id / 自增序号 —— 平台每轮重建
+    scope 后必然不同；而平台每轮重新 Add 相同数据，只有内容本身是跨轮稳定的。
+    排序 tie（量化后的同桶、RRF 同分）在跨轮之间要落出同一顺序，必须用内容键。
+    轻量代理对象（如 PRF merge 测试/路径）没有 response_content 时回退 view_id。
+    """
+    content = getattr(entry, "response_content", None)
+    if content is None:
+        content = str(getattr(entry, "view_id", ""))
+    return hashlib.sha1(content.encode("utf-8")).digest()
 
 
 class SearchService:
@@ -1308,11 +1322,14 @@ class SearchService:
             key=lambda index: (
                 -round(entries[index].candidate.score, 12),
                 entries[index].candidate.best_rank,
-                entries[index].candidate.window_id,
+                _content_key(entries[index]),
             ),
         )
         retrieval_rank = {index: rank + 1 for rank, index in enumerate(by_retrieval)}
-        by_rerank = sorted(range(len(entries)), key=lambda index: (-scores[index], index))
+        by_rerank = sorted(
+            range(len(entries)),
+            key=lambda index: (-scores[index], _content_key(entries[index])),
+        )
         rerank_rank = {index: rank + 1 for rank, index in enumerate(by_rerank)}
 
         fused = [
@@ -1381,7 +1398,7 @@ class SearchService:
             key=lambda pair: (
                 -round(pair[1], 12),
                 pair[0].candidate.best_rank,
-                pair[0].view_id,
+                _content_key(pair[0]),
             ),
         )
 
@@ -1443,6 +1460,9 @@ class SearchService:
                 "The reranker returned an incomplete result set.",
                 status_code=503,
             )
+        quant = float(getattr(self._pipeline.reranker, "score_quantization", 0.0) or 0.0)
+        if quant > 0:
+            return [round(round(score / quant) * quant, 10) for score in result]
         return [float(score) for score in result if score is not None]
 
     def _select_output(

@@ -7,7 +7,7 @@
     "dimension": "auto-detect-on-first-successful-embedding",
     "query_instruction": "Instruct: Given a search query, retrieve relevant memories that answer the query\nQuery:",
     "document_instruction": null,
-    "batch_items": 10,
+    "batch_items": 1,
     "batch_proxy_tokens": 8192,
     "input_proxy_tokens": 4096
   },
@@ -24,7 +24,8 @@
     "ordinary_candidate_groups": 100,
     "wide_candidate_groups": 100,
     "batch_groups": 16,
-    "max_concurrency": 4
+    "max_concurrency": 4,
+    "score_quantization": 0.1
   },
   "chunking": {
     "leaf": {
@@ -73,7 +74,7 @@
     },
     "neighbor_expand_chars": 0,
     "channel_consensus_bonus": 0.0,
-    "similarity_weight": 0.05,
+    "similarity_weight": 0.0,
     "consensus_weight": 0.0,
     "speaker_weight": 0.0,
     "per_source_cap": 1,
@@ -81,7 +82,7 @@
   },
   "groups": {
     "max_spans": 4,
-    "direct_max_tokens": 896,
+    "direct_max_tokens": 640,
     "context_max_tokens": 1536,
     "head_records": 0,
     "tail_cut_chars": 0,
@@ -89,7 +90,7 @@
     "time_anchor_in_text": true,
     "time_anchor_scope": "temporal",
     "time_anchor_template": "Session {session} ({date})",
-    "timeline_in_text": true
+    "timeline_in_text": false
   },
   "coverage": {
     "always_full_tokens": 4096,

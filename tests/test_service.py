@@ -739,3 +739,56 @@ def test_time_anchor_scope_all_covers_non_temporal_questions(tmp_path):
     line = body["data"][0]["content"].splitlines()[0]
     assert line == "(26 Jan, 2024)", line
     assert "Session" not in line, "没有 session 号时不该留空壳"
+
+
+class _FixedScoreProvider:
+    """返回固定分数序列的 rerank stub，用于验证 config 量化参数真的被读取。"""
+
+    def __init__(self, scores: list[float]) -> None:
+        self._scores = scores
+
+    def embed(self, texts):
+        return [[0.0, 0.0, 1.0] for _ in texts]
+
+    def rerank(self, query, documents):
+        return [
+            RerankScore(index=index, score=score)
+            for index, score in enumerate(self._scores[: len(documents)])
+        ]
+
+    def close(self) -> None:
+        pass
+
+
+def test_rerank_score_quantization_is_read_from_pipeline_config():
+    """score_quantization 必须真实接线：0.0 保留原始分数，>0 时分数被 round 到粒度。
+
+    背景（2026-10-15）：llama.cpp GPU 批推理的 run-to-run 分数波动（±0.02~0.06）
+    会让边缘 pair 的排名轮间抖动，量化 0.1 把波动吸收成确定性 tie。此测试防止
+    config 键变成"声明了但代码从不读取"的装饰字段（AGENTS.md 坑 8）。
+    """
+    import time as _time
+    from types import SimpleNamespace
+
+    from memorysum.services.search import SearchService
+    from memorysum.settings import load_pipeline_config
+
+    config = load_pipeline_config()
+    assert isinstance(config.reranker.score_quantization, float)
+
+    docs = [
+        SimpleNamespace(rerank_content="alpha"),
+        SimpleNamespace(rerank_content="beta"),
+    ]
+
+    def run(quantization: float) -> list[float]:
+        service = object.__new__(SearchService)
+        service._provider = _FixedScoreProvider([0.34, 0.30])
+        service._pipeline = SimpleNamespace(
+            reranker=config.reranker.model_copy(update={"score_quantization": quantization})
+        )
+        return service._rerank_entries("q", docs, _time.monotonic() + 30)
+
+    assert run(0.0) == [0.34, 0.30]
+    assert run(0.1) == [0.3, 0.3]
+    assert run(0.5) == [0.5, 0.5]
