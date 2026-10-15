@@ -6,14 +6,21 @@
 
 原文保真的记忆服务：`Add` 写入、`Search` 检索。FastAPI + SQLite（FTS5 + sqlite-vec），模型侧依赖本机 llama.cpp 提供 embedding 与 cross-encoder rerank。**不生成答案，只返回可回溯到原文的证据片段。**
 
+## 当前部署状态（2026-10-15 起）
+
+**两个常驻进程**：
+- memorysum `:8001`（FastAPI 服务）
+- embedding `:7999`（`Qwen3-Embedding-4B-Q8_0`，F16 KV cache，官方 llama.cpp）
+- reranker `:7997`（`bge-reranker-v2-m3-F16`，官方 llama.cpp，`--reranking --pooling rank`）
+
+**已回退的改动**（历史记录，不在当前版本）：
+- jina-reranker-v3.5（fork llama.cpp + projector MLP + rerank_server.py）→ 已回退到 bge
+- qinstr2（新 query instruction）→ 已回退到旧指令
+- chunk512（大窗口）→ 已回退到 leaf 256 / context 320
+
 ## 环境与运行
 
 - Python 3.12（`>=3.12,<3.13`），虚拟环境在 `.venv/`
-- **四个常驻进程（2026-10-15 起，jina 上线）**：memorysum `:8001`、embedding `:7999`（官方 llama.cpp）、
-  **jina backbone `:7995`**（fork llama.cpp 的 llama-server，qwen3-swa 分支）+ **rerank server `:7997`**
-  （`/home/rain/model/jina-v3.5/rerank_server.py`，FastAPI，跑在 thx01-venv 的 Python）。bge-reranker 已下线
-  （一键回退命令在 README「bge 回退」与 commit 548db4d）；THX-01:8095 已停（evidence 段默认关，重启命令存
-  /tmp/thx01_restart_cmd.txt）。启动命令与显存实测见 README「服务拓扑」与 /home/rain/model/llama.cpp-qwen3-swa/PATCH.md
 - 常用命令（**都用 `.venv/bin/*`，不要用 `uv run`**）：
   ```bash
   .venv/bin/python -m pytest -q

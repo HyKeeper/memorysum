@@ -1,13 +1,13 @@
 {
-  "pipeline_id": "memorysum-hybrid-preview-v0.5.0-qinstr2",
+  "pipeline_id": "memorysum-hybrid-preview-v0.5.0",
   "qualification_status": "provisional",
   "embedding": {
     "provider": "local-openai",
     "model": "qwen3-embedding-4b",
     "dimension": "auto-detect-on-first-successful-embedding",
-    "query_instruction": "Instruct: Retrieve personal memory passages that contain evidence needed to answer the user's question, including facts, preferences, constraints, events, and temporal or causal relationships.\nQuery:",
+    "query_instruction": "Instruct: Given a search query, retrieve relevant memories that answer the query\nQuery:",
     "document_instruction": null,
-    "batch_items": 1,
+    "batch_items": 10,
     "batch_proxy_tokens": 8192,
     "input_proxy_tokens": 4096
   },
@@ -15,7 +15,7 @@
     "enabled": true,
     "fusion_weight": 2.0,
     "provider": "local-openai",
-    "model": "jina-reranker-v3.5",
+    "model": "bge-reranker-v2-m3",
     "instruction": "",
     "single_pair_proxy_tokens": 4608,
     "max_query_proxy_tokens": 6144,
@@ -24,8 +24,7 @@
     "ordinary_candidate_groups": 100,
     "wide_candidate_groups": 100,
     "batch_groups": 16,
-    "max_concurrency": 4,
-    "score_quantization": 0.0
+    "max_concurrency": 4
   },
   "chunking": {
     "leaf": {
@@ -89,8 +88,7 @@
     "normalize_whitespace": false,
     "time_anchor_in_text": true,
     "time_anchor_scope": "temporal",
-    "time_anchor_template": "Session {session} ({date})",
-    "timeline_in_text": false
+    "time_anchor_template": "Session {session} ({date})"
   },
   "coverage": {
     "always_full_tokens": 4096,
@@ -123,17 +121,5 @@
     "min_chars": 15,
     "max_state_chars": 1000,
     "timeout_seconds": 15.0
-  },
-  "query_expansion": {
-    "enabled": false,
-    "min_top_k": 30,
-    "recall": 100,
-    "terms": 8,
-    "weight": 0.4,
-    "gate_percentile": 70,
-    "min_related": 3,
-    "max_new": 40,
-    "max_df_ratio": 0.35,
-    "drift_guard": 0.0
   }
 }

@@ -60,13 +60,6 @@ class RerankerConfig(FrozenConfig):
     wide_candidate_groups: int
     batch_groups: int
     max_concurrency: int
-    #: rerank 分数量化粒度（0.0 = 关闭）。>0 时把 cross-encoder 分数 round 到该粒度
-    #: 再参与排序：llama.cpp GPU 批推理（连续 batching 混合并发请求）的 run-to-run
-    #: 分数波动实测 ±0.02~0.06，粒度 0.1 可把边缘 pair 的排名抖动吸收成确定性 tie
-    #: （tie-break 走 best_rank/window_id，本身确定）。实测（2026-10-15）：0.1 在两题
-    #: 并发下把 Reach 24 题前 13 位锁死（含 few-shot 示例关键位 6/7），0.05 仍抖、
-    #: ≥0.15 制造过多 tie 反而在别处抖。0.0 保持逐字使用模型返回分数。
-    score_quantization: float = 0.0
 
 
 class RetrievalModeConfig(FrozenConfig):
@@ -78,39 +71,6 @@ class RetrievalModeConfig(FrozenConfig):
     candidate_cap: int
     output_records: int
     output_tokens: int
-
-
-class QueryExpansionConfig(FrozenConfig):
-    """伪相关反馈（RM3 式）的查询扩展参数；机制见 `core/expansion.py`。
-
-    **不引入任何生成式模型**：只有词频、文档频次与现成的 embedding。
-    """
-
-    enabled: bool = False
-    #: 调用方要的结果少于这个数就不扩展：`top_k` 小说明只要少数结果，
-    #: 此时扩展带来的漂移风险大于收益。
-    min_top_k: int = 30
-    #: 二次检索的初始召回条数（用户的 N）。
-    recall: int = 100
-    #: 扩展词个数 m。
-    terms: int = 8
-    #: 扩展权重 α（向量插值的系数）。
-    weight: float = 0.4
-    #: 门控阈值：只取 rerank 分数在该分位之上的文档当伪相关集。
-    gate_percentile: int = 70
-    #: 伪相关集小于这个数就整体回退到原始查询。
-    min_related: int = 3
-    #: 二次检索最多引入多少条新候选（防止新结果反客为主）。
-    max_new: int = 40
-    #: 丢掉出现在超过这个比例窗口里的词（区分度为零）。
-    max_df_ratio: float = 0.35
-    #: >0 时启用漂移哨兵：扩展词与原始查询向量的平均余弦低于它则回退。
-    drift_guard: float = 0.0
-    #: 新候选的插入策略：`score` = 与原有候选同池按分数排序（可能顶替原排名）；
-    #: `append` = 新候选只追加在原排名之后（严格保证原排序不被改写，只在 top_k
-    #: 与 token 预算允许时多交几条证据）。用户设计意图“扩出的新答案不应顶替
-    #: 高相似度答案”对应 `append`；实测 `score` 会掉 top-1（见 sweep 台账）。
-    merge_policy: str = "score"
 
 
 class RetrievalConfig(FrozenConfig):
@@ -192,10 +152,6 @@ class GroupConfig(FrozenConfig):
     #: 正文里没有"看得见"的绝对时间时，是否按平台保留的锚点形态补一行
     #: `Session 1 (17 Jan, 2024)`（默认关闭；`Time:` 前缀会被平台删掉，所以不用那种）。
     time_anchor_in_text: bool = False
-    #: 时间/顺序类问题是否把返回里已有的会话锚点排成时间线，前置到响应最前面
-    #: （qa_ab.py 的 C 方案，`Conversation timeline: Session N = <date>`）。
-    #: **默认关闭**；只重排已有锚点、不新增事实，靶子是 C1/C2/I1 的顺序题。
-    timeline_in_text: bool = False
     #: 锚点的适用范围：`temporal` 只给时间/顺序类问题（默认），`all` 给所有问题。
     #: 平台侧吃锚点的叶子（C1/C2/I1）全是时间/顺序类，而 41 条可观测 query 只覆盖其中
     #: 7 条 —— 实例集在观测之外，扩大覆盖面是唯一不依赖猜测的做法。非时间题多一行
@@ -208,13 +164,6 @@ class CoverageConfig(FrozenConfig):
     always_full_tokens: int
     conditional_full_tokens: int
     conditional_full_requires_wide_or_context_mode: bool
-    #: 小于 `always_full_tokens` 的 scope 是否也对**普通查询**开放全量交付。
-    #: 默认 False = 保持历史行为（只对 wide/context 查询开放）。设为 True 的实验假设：
-    #: 小 scope 的全部内容都放得下（≤4096 token），而窗口切分会把“昨天 → 02 Jan”
-    #: 这类跨窗上下文切碎——locomo 时间题恰好都是小 scope（29~700 条短消息）。
-    #: 语料消息长（>窗口）时不开，因为整条消息会稀释 rerank 信号（实测 full_bundle
-    #: 对长消息曾把 gold 从第 1 名砸到第 19 名）。
-    always_full_for_all_queries: bool = False
     safe_input_tokens: int
     estimation_safety_factor: float
     platform_instruction_reserve: int
@@ -244,7 +193,6 @@ class PipelineConfig(FrozenConfig):
     reranker: RerankerConfig
     chunking: ChunkingConfig
     retrieval: RetrievalConfig
-    query_expansion: QueryExpansionConfig = QueryExpansionConfig()
     groups: GroupConfig
     coverage: CoverageConfig
     capacity: CapacityConfig

@@ -32,7 +32,6 @@ import json
 import os
 import sys
 import time
-from pathlib import Path
 
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.getcwd(), "src"))
@@ -172,16 +171,9 @@ def normalise(text: str) -> str:
     return " ".join(text.split())
 
 
-def load_config_override(path: str):
-    """从任意路径读一份 PipelineConfig —— 只给离线实验用，不碰生产配置文件。"""
-    from memorysum.settings import PipelineConfig
-
-    return PipelineConfig.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
-
-
-def build_service(user_id: str, pipeline=None):
+def build_service(user_id: str):
     runtime = RuntimeSettings.from_environment()
-    pipeline = pipeline or load_pipeline_config()
+    pipeline = load_pipeline_config()
     space = hashlib.sha256(
         (pipeline.embedding_space_id + "\n" + embedding_endpoint(runtime, pipeline)).encode()
     ).hexdigest()
@@ -237,10 +229,6 @@ def contains_verbatim(text: str, target: str, run: int = _VERBATIM_RUN) -> bool:
     return False
 
 
-#: 每次 Search 的 top_k；main() 会按 --top-k 覆盖它。
-TOP_K = 10
-
-
 def ids_hit(item, gold_ids: tuple[str, ...]) -> bool:
     """平台的 Recall 口径：条目上的 id 能否定位到 gold（AGENTS.md 第 9 条）。"""
     return bool(gold_ids) and bool(set(item.source_ids or ()) & set(gold_ids))
@@ -250,7 +238,7 @@ def evaluate(service, user_id: str, gold, dump: bool) -> tuple[list, list, list]
     ranks, id_ranks, latencies = [], [], []
     for query, gold_id, _marker in CASES:
         started = time.perf_counter()
-        response = service.search(SearchRequest(query=query, user_id=user_id, top_k=TOP_K))
+        response = service.search(SearchRequest(query=query, user_id=user_id, top_k=10))
         latencies.append(time.perf_counter() - started)
         target, gold_ids = gold.get(gold_id, ("", ()))
         rank = None
@@ -282,23 +270,9 @@ def main() -> None:
     parser.add_argument("--user-id", default=DEFAULT_USER)
     parser.add_argument("--dump-rank", action="store_true", help="打印每条查询的排名")
     parser.add_argument("--no-split-half", action="store_true", help="跳过 split-half")
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=10,
-        help="每次 Search 的 top_k。平台用 100；本地默认 10 是为了让 top1/top3 指标聚焦头部。"
-        "注意：查询扩展（PRF）只在 top_k >= query_expansion.min_top_k 时才触发，测它要传 100",
-    )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="用这个 JSON 文件覆盖打包配置（离线实验用；生产配置文件保持不动）",
-    )
     args = parser.parse_args()
-    global TOP_K
-    TOP_K = args.top_k
 
-    pipeline = load_config_override(args.config) if args.config else load_pipeline_config()
+    pipeline = load_pipeline_config()
     reranker = pipeline.reranker
     print(f"pipeline   : {pipeline.pipeline_id}")
     print(f"embedding  : {pipeline.embedding.provider} / {pipeline.embedding.model}")
@@ -309,7 +283,7 @@ def main() -> None:
     print(f"user_id    : {args.user_id}")
     print(f"queries    : {len(CASES)}\n")
 
-    service, provider, database = build_service(args.user_id, pipeline)
+    service, provider, database = build_service(args.user_id)
     try:
         gold = load_gold(database, args.user_id)
         started = time.perf_counter()

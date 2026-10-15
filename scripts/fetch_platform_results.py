@@ -240,32 +240,6 @@ def cmd_diff(jobs: list[dict], pair: list[str] | None = None) -> None:
     print(f"\n变动叶子数：{changed}（0 = 两轮在这一层完全一致）")
 
 
-#: 平台 subcapability id → 本地判定口径 (本地把 streaming.* 叫 I1/I2，见 AGENTS.md)。
-PLATFORM_TO_LOCAL_LEAF = {
-    "streaming.online": "I1",
-    "streaming.intra_transfer": "I2",
-    "streaming": "I",
-}
-
-
-def _local_leaf_rows(job: dict) -> dict[str, float]:
-    """与 `_leaf_rows` 相同，但把平台叫法映射成本地判定口径的名字。
-
-    平台的 20 个叶子里有两片叫 `streaming.online` / `streaming.intra_transfer`，
-    本地逐题判定与旧工具一直用 `I1` / `I2`；树文件是给本地对齐工具读的，
-    所以在这里统一，避免每次读的时候各自记一套映射。`_leaf_rows` 会跳过
-    `capabilities` 里的 `streaming` 聚合项（它是 I1/I2 的父，不是叶子），
-    但对齐表需要它的 62.5 作为 I 的值，所以这里单独补回来。
-    """
-    rows = {
-        PLATFORM_TO_LOCAL_LEAF.get(name, name): value for name, value in _leaf_rows(job).items()
-    }
-    for item in (job.get("result") or {}).get("capabilities") or []:
-        if item.get("id") == "streaming":
-            rows["I"] = float(item.get("score") or 0.0)
-    return rows
-
-
 def cmd_save(jobs: list[dict], key: str, directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(CST).strftime("%Y-%m-%dT%H%M%S%z")[:-2]
@@ -284,66 +258,12 @@ def cmd_save(jobs: list[dict], key: str, directory: Path) -> None:
     return None
 
 
-def cmd_tree(jobs: list[dict], dest: Path) -> None:
-    """把全部轮次落成 `eval_local_score.py` / `eval_alignment.py` / `record_score.py`
-    能直接读的树文件（`{"runs": [{"label", "total", "leaves"}]}`，分数为 0-100）。
-
-    只保留**真正产出能力树**的轮（失败轮 score=0 且 caps 为空，收进来会把「最新轮」
-    污染成 0 分）；分数一律换算成百分比，与本地判定同口径。这样以后每跑一轮平台分，
-    一条命令就让本地对齐工具看到最新基准，不需要再手写 JSON 或改脚本常量。
-    """
-    ordered = sorted(
-        [job for job in jobs if _local_leaf_rows(job)],
-        key=lambda job: job.get("created_at") or "",
-    )
-    runs: list[dict] = []
-    for job in ordered:
-        cst, hhmm = _stamp(job.get("created_at") or "")
-        score = (job.get("result") or {}).get("score")
-        runs.append(
-            {
-                "id": job.get("evaluation_id"),
-                "label": hhmm,
-                "phase": job.get("phase"),
-                "created_at": job.get("created_at"),
-                "local_time": cst,
-                "total": round(float(score) * 100, 2) if isinstance(score, (int, float)) else None,
-                "leaves": {
-                    leaf: round(value * 100, 2) for leaf, value in _local_leaf_rows(job).items()
-                },
-            }
-        )
-    if not runs:
-        print("没有可写成树的轮次（都不含能力树）")
-        return None
-    payload = {
-        "note": (
-            "平台逐轮分数树：由 scripts/fetch_platform_results.py --save-tree 生成，"
-            "eval_local_score.py / eval_alignment.py / record_score.py 读这份文件做对照。"
-            "分数为百分比（0-100）；平台叶子名 streaming.online / streaming.intra_transfer "
-            "已在生成时映射为本地口径 I1 / I2（streaming→I），保持 20 叶子 + 父能力的原名。"
-        ),
-        "generated_at": datetime.now(CST).isoformat(),
-        "base_url": BASE_URL,
-        "runs": runs,
-    }
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"已写入 {dest}（{len(runs)} 轮；最新 {runs[-1]['label']} 总分 {runs[-1]['total']:.2f}）")
-    return None
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="读取 AML 评测 API 的历史结果")
     parser.add_argument("--leaves", action="store_true", help="打印逐叶子明细表")
     parser.add_argument("--diff", nargs="*", metavar="EVAL_ID", help="比较两轮（默认最后两轮）")
     parser.add_argument("--only", metavar="EVAL_ID", help="只看某一轮（配合 --leaves）")
     parser.add_argument("--save", metavar="DIR", help="把完整 JSON 快照写到目录")
-    parser.add_argument(
-        "--save-tree",
-        metavar="FILE",
-        help="把全部轮次写成本地对齐工具能读的树文件（如 backups/platform_tree.json）",
-    )
     parser.add_argument("--json", action="store_true", help="直接打印原始 JSON")
     args = parser.parse_args(argv)
 
@@ -358,9 +278,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.save:
         cmd_save(jobs, key, Path(args.save))
-        return 0
-    if args.save_tree:
-        cmd_tree(jobs, Path(args.save_tree))
         return 0
     if args.leaves:
         cmd_leaves(jobs, only=args.only)
