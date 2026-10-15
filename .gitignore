@@ -32,3 +32,14 @@ htmlcov/
 
 # Local backups (load-test snapshots etc.)
 /backups/
+
+# Non-core modules (kept locally, not pushed to GitHub)
+bench/
+docs/
+exp/
+scripts/
+backups/
+tmp/
+*.md
+!README.md
+!AGENTS.md
