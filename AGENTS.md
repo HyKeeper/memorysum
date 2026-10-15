@@ -9,7 +9,11 @@
 ## 环境与运行
 
 - Python 3.12（`>=3.12,<3.13`），虚拟环境在 `.venv/`
-- 三个进程：memorysum `:8001`、embedding `:7999`、rerank `:7997`（llama.cpp 一实例一模型，所以 embedding 与 rerank 必须分开；启动命令见 README 的「服务拓扑」）
+- **四个常驻进程（2026-10-15 起，jina 上线）**：memorysum `:8001`、embedding `:7999`（官方 llama.cpp）、
+  **jina backbone `:7995`**（fork llama.cpp 的 llama-server，qwen3-swa 分支）+ **rerank server `:7997`**
+  （`/home/rain/model/jina-v3.5/rerank_server.py`，FastAPI，跑在 thx01-venv 的 Python）。bge-reranker 已下线
+  （一键回退命令在 README「bge 回退」与 commit 548db4d）；THX-01:8095 已停（evidence 段默认关，重启命令存
+  /tmp/thx01_restart_cmd.txt）。启动命令与显存实测见 README「服务拓扑」与 /home/rain/model/llama.cpp-qwen3-swa/PATCH.md
 - 常用命令（**都用 `.venv/bin/*`，不要用 `uv run`**）：
   ```bash
   .venv/bin/python -m pytest -q
@@ -50,11 +54,12 @@
 
 **必须同时看 split-half，不能只看全样本净值。** 实测教训：纯 rerank 排序的全样本成绩是"净 +1"，看着像小胜；拆成两半却是 **+4 / −3**——两半相抵的假象掩盖了它其实不可靠。凡是"用新信号取代旧信号"的改动，都要用两半各自成立来证明。
 
-当前基准（2026-10-14 重测，`fusion_weight=2.0`、单对预算 4608、`-ub 8192`）：
-**txt_all top-1 47/60、top-3 55/60、MRR 0.855；ids_all top-1 39/60、top-3 49/60、MRR 0.745**
-（split-half 两半都成立：前半 26/27、后半 21/28 top-1）。2026-10-13 记的「top-1 38/60、
-MRR 0.73」是旧口径（当时用「正文前 100 字符」判据、且时间锚点还没上线），与现在的
-ids_all 对齐（39/60、0.745），不是质量下滑——详见第 32、33 条。
+当前基准（2026-10-15，**jina-reranker-v3.5 + 旧 query instruction**）：
+**txt_all top-1 49/60、top-3 56/60、MRR 0.8822；ids_all top-1 39/60（历史最好，bge 时代 37）、top-3 50/60、MRR 0.7459**
+（ids split-half 19/20 两半成立）。BEAM 全量 383s、p50 6.3s/查询。
+**qinstr2（新 query instruction）上线后未重测**：库向量不变（document 侧无指令）但 query 向量已变，
+数字会漂；且实测旧 scope 未被 503 拦截（第 51 条），行为待查。历史参考：bge 时代同口径
+txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见第 32、33 条）。
 
 ## 踩过的坑（都已实测，别重复尝试）
 
@@ -135,6 +140,38 @@ ids_all 对齐（39/60、0.745），不是质量下滑——详见第 32、33 �
     对"交付量/窗口选择"一类改动**不敏感**（`output_tokens` 32768→65536 在它上面是 no-op，因为 32768 已经够 109 条
     > top_k=100）。**判断某类改动该用哪个尺子**：排序/召回 → BEAM 的 txt_all/ids_all；交付量 → 真实 41 题的
     `audit_question_coverage.py` + 逐个查答案；两把尺子都动才叫真的变了。
+43. **GPU 批推理 run-to-run 非确定 = 轮间分数摆动的根源**（2026-10-15 实测，解开了 74.90 vs 71.14 之谜）：
+    llama.cpp 同输入两次执行，rerank 分数漂 ±0.02~0.06（并发批混合的时序不同）、embedding 向量差可达
+    5e-3（add 批组成不同）→ 边缘 pair 排名翻转 → 响应**条数 ±1~2、顺序大量错位而内容集合不变** →
+    平台 Answer 按顺序读上下文 → 边缘判定点翻转（G4 100↔50）。同配置同数据自差 3.37 分（第 8/9 轮
+    同进程实证）。修复三件套（全部实测零回归，commit a48fde0）：`reranker.score_quantization`
+    （config 新字段；bge 时代 0.1 吸收波动、jina 天然 bit 确定所以 0）、`embedding.batch_items=1`
+    （逐条请求，向量跨轮 bit 一致）、排序 tie-break 换 `_content_key`（response_content 的 sha1）
+    替代 view_id/window_id——物理 id 每轮 scope 重建必变，只有内容跨轮稳定。**rrf_k 扫描
+    10/15/18/20/25/60 全都治不了这个**（波动在模型层不在融合权重），且固定 k≠adaptive 会改变全部排序。
+44. **不要用 per-block subprocess 形态跑 jina**：官方 rerank.py 每块拉一个 llama-embedding 子进程，
+    每块重载 ~2GB 权重（p50 16.5s、进程时有时无、显存随块波动）→ 常驻 server（7995 backbone +
+    7997 FastAPI wrapper，用户要求内存）。pooling none 默认返回**全部 ~16k 行 ≈140MB JSON**
+    （实测反而更慢 79s/请求）→ 必须 `--output-token-ids 151670,151671` 过滤（fork 的 server 原本
+    不支持，本地补丁见 /home/rain/model/llama.cpp-qwen3-swa/PATCH.md）。过滤后返回的就是紧凑行
+    [Q_EARLY, DOC_0.., Q_LATE]，**Python 侧不能再按 prompt 绝对位置索引**（会 IndexError）；
+    行数由 _score_block 的 expected == n_docs+2 校验。
+45. **fork 的 SWA KV cache 在 ctx ≈39k~50k SIGSEGV**（39424/49408/50432 实测崩，31744 及以下稳）：
+    块容量必须压到 16384（显存峰值 13343，余 ~3GB）。构建时 `-DCMAKE_CUDA_ARCHITECTURES=89`——
+    nvcc 12.4 不认 sm_120a（RTX 5060 Ti），照抄官方 build 的 CMakeCache。
+46. **候选 reranker 实测记录（2026-10-15，别重复）**：Qwen3-Reranker-0.6B（gorse-io，rank 头正确、
+    冒烟区分度好）ids1 33/60（bge 37）+ 慢 2.8 倍，否决；Qwen3-VL-Reranker-2B（mradermacher）与
+    jina-v3.5 官方 GGUF 都**无 rank pooling 头**（"pooling_type [-1]"），llama.cpp `--pooling rank`
+    强行读输出全 0——jina 必须按官方路径跑（fork + projector MLP + rerank.py，见 README 拓扑）。
+    jina 上线后 **ids1 39/60 历史最好**（split-half 19/20 均衡）。第 7 条教训三次印证：换更强小模型不解决问题。
+47. **同配置的分数带**（2026-10-15 确认）：74.90 是 G4=100 幸运态（13 轮唯一一次），常见态
+    71.14~71.53；平台自身复现性 ±3.4。报分必须带叶子档位（G4/C1/C2/I1），把高态当基线会高估自己改动。
+48. **EVAL_API_CONTRACT_MISMATCH · HTTP 400（2026-10-15 14:26，未解）**：我们侧 186 个请求全 200
+    （比历史轮不少一个），评测卡 running 20+ 分钟——400 在平台侧或根本没到我们。排查顺序：
+    日志 UTC 时差 → 非 200 统计 → 请求数对比历史轮 → 平台 evaluations API 的状态/error 字段。
+49. **旧 scope 未拦 instruction-only bump**（待查）：qinstr2 后旧 scope 冒烟仍成功（预期 503
+    pipeline_mismatch）——校验点可能没拦 instruction 变化，同 scope 新旧向量混存的风险在案；
+    平台每轮重建 scope 所以实际影响暂为零，但不要在旧 scope 上做对照实验。
 
 ## 本机环境的坑
 
@@ -154,7 +191,9 @@ ids_all 对齐（39/60、0.745），不是质量下滑——详见第 32、33 �
   [ "$NEW" != "$REAL" ] && echo "真的换了进程 ✅" || echo "没重启成功 ❌"
   ```
   停机实测 4.5~6.0 s（有平台 keep-alive 连接时）。
-- **三种服务都是裸进程**，机器重启不自动恢复（尚无 systemd unit）；memorysum 依赖 7999/7997 可达，否则 Add/Search 返回 503。
+- **四种服务都是裸进程**，机器重启不自动恢复（尚无 systemd unit）；memorysum 依赖 7999/7997 可达，否则 Add/Search 返回 503。
+- **日志时间戳是 UTC（带 Z），与本地时间差 8 小时**：专家说「14:26 出 400」要在日志里查 `T06:26`——排查时间点先转换（2026-10-15 实测确认）。
+- **外网入口验证用 check-host.net**（`https://check-host.net/check-tcp?host=...` API）：本机 curl 外网地址不通很可能只是 hairpin NAT（路由器不回环转发），不代表外网不可达——2026-10-15 实测 4 探针节点 3 通 0.4-1.3s。
 - **读压测/评测日志别用"就近的 http_request 行"配对结构化事件**：Add/Search 的 `api_*` 事件行与 uvicorn 的 `http_request` 行是并发交错的，实测会把 Add 的 payload 配到 Search 的状态码上。**按 `trace_id` 关联**才对（工具：`scripts/extract_loadtest_requests.py`）。另外 `api_*` 事件行只在 `MEMORYSUM_DEBUG` 打开时才写。
 - 数据目录 `data/`、`logs/`、`keys.txt`、`.env` 都在 `.gitignore` 里；`keys.txt` 每行一个裸 Bearer token。
 
@@ -274,6 +313,12 @@ smoke 的问答对还可能被直接命中。实测平台前 5 轮都是**全新
 
 ## 提分的两个机制性动作（2026-10-14 实测落地）
 
+> **当前在跑的第三个动作（2026-10-15）：jina-reranker-v3.5 上线 + query instruction 重写**。
+> jina 在 BEAM 上 ids_all top1 39/60（历史最好，bge 37）、split-half 19/20 均衡（见基准段与坑 43/46）；
+> 新指令（qinstr2）无本地验证、与 jina 同轮上线（两变量，归因混——时间紧主动接受）。
+> 预期靶子：ids 相关叶子的定位（A/B/C 系）与 G4 的 few-shot 顺序判定；验证点 = 下一轮 smoke 的
+> QA feedback 与叶子档位（风险：平台 search 超时口径未知，jina 延迟 ×4~5）。
+
 本地判定把 41 题的失分归因分成：`ok=21 / anchor=6 / retrieval=4 / memory=4 / partial=3 /
 judge=1 / n/a=2`。**能自己改的只有 anchor 与 retrieval 两类**，其余是平台侧（生成、灌库、判据）。
 
@@ -366,6 +411,8 @@ D2 40.00 / G2 20.00 / H2 50.00 / G4 50.00 / I2 50.00 / A1 66.67 / D1 66.67，其
 
 ## 会话记录
 
+- [`docs/score_ledger.md`](docs/score_ledger.md)：**13+ 轮平台跑分台账**（每轮的 config 指纹、进程、
+  逐叶变化、归因）——第 8 轮 74.90（G4 幸运态）、第 9 轮 71.53（同配置反例）都在里面。**报分/对比先读它**。
 - [`docs/round5-prereg.md`](docs/round5-prereg.md)：第 5 轮（锚点全量覆盖）的预注册 —— 靶子叶子
   C1/C2/I1、回归锚点 locomo1、成功/失败信号、回滚方式，以及三条支撑它的新实测
   （feedback 时序、384 vs 640 重测、超限分布）。**跑分前先读它，跑分后按它判定。**
