@@ -15,7 +15,7 @@
     "enabled": true,
     "fusion_weight": 2.0,
     "provider": "local-openai",
-    "model": "bge-reranker-v2-m3",
+    "model": "jina-reranker-v3.5",
     "instruction": "",
     "single_pair_proxy_tokens": 4608,
     "max_query_proxy_tokens": 6144,
@@ -25,7 +25,7 @@
     "wide_candidate_groups": 100,
     "batch_groups": 16,
     "max_concurrency": 4,
-    "score_quantization": 0.1
+    "score_quantization": 0.0
   },
   "chunking": {
     "leaf": {
