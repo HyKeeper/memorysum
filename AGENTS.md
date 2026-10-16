@@ -10,8 +10,16 @@
 
 **两个常驻进程**：
 - memorysum `:8001`（FastAPI 服务）
-- embedding `:7999`（`Qwen3-Embedding-4B-Q8_0`，F16 KV cache，官方 llama.cpp）
-- reranker `:7997`（`bge-reranker-v2-m3-F16`，官方 llama.cpp，`--reranking --pooling rank`）
+- embedding `:7999`（`Qwen3-Embedding-4B-Q8_0`，F16 KV cache，官方 llama.cpp，**`--cache-ram 0`**）
+- reranker `:7997`（`bge-reranker-v2-m3-F16`，官方 llama.cpp，`--reranking --pooling rank`，**`--cache-ram 0`**）
+
+> **两个模型服务必须带 `--cache-ram 0` 启动**（2026-10-16）。llama.cpp 的 prompt cache 对
+> BERT/embedding 这类非 causal pooling 模型**永不淘汰**（state 大小恒为 0 → 容量上限失效；
+> `size_per_token` 被 `max(1.0, 0/n_tokens)` 钉在 1.0 → token 上限被放大成 8.6e9），
+> 每处理一条输入就永久留存一条，且每个任务都要全表扫一遍。实测：rerank 连续跑 24h、
+> 处理 ~77.6 万条文档后**退化 4.4 倍**（同样 100 条文档：23.0s vs 新实例 5.2s；16 条小文档
+> 2.9s vs 71ms），RSS 从 4.3GB 涨到 9.8GB；embedding 服务 1 token 输入要 740ms（新实例 17ms）。
+> 见「踩过的坑」第 50 条与 `docs/session-2026-10-16-server-degradation.md`。
 
 **已回退的改动**（历史记录，不在当前版本）：
 - jina-reranker-v3.5（fork llama.cpp + projector MLP + rerank_server.py）→ 已回退到 bge
@@ -179,6 +187,31 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
 49. **旧 scope 未拦 instruction-only bump**（待查）：qinstr2 后旧 scope 冒烟仍成功（预期 503
     pipeline_mismatch）——校验点可能没拦 instruction 变化，同 scope 新旧向量混存的风险在案；
     平台每轮重建 scope 所以实际影响暂为零，但不要在旧 scope 上做对照实验。
+50. **模型服务的 prompt cache 会把自己拖垮（2026-10-16，已修）——search 变慢的头号元凶**。
+    症状：搜索 p50 从 7s 一路涨到 310s；平台一轮 ~15 个 search 并发，我们只开 2 个槽 →
+    每个查询排队 5 分钟。根因不在我们代码：**llama.cpp 对非 causal pooling 模型（bge reranker、
+    embedding 服务都是）的 prompt cache 永不淘汰**——`server_prompt_cache::update()` 里
+    `size()` 恒为 0（没有 KV state）→ 容量上限失效；`size_per_token = max(1.0, 0/n_tokens) = 1.0`
+    → `limit_tokens_cur = max(8192, 8192MiB/1.0) = 8589934592`（日志里的 `est` 值）→ token 上限也失效。
+    于是**每处理一条输入就永久存一条**（实测 4200 条文档 → 1762 条缓存、0 次淘汰告警），而
+    `alloc()` / `load()` 对**每个任务都要全表扫一遍缓存**（`get_common_prefix` 逐条比 token）→
+    成本随历史任务数线性增长。量化：rerank 连续跑 24h / 77.6 万条文档后，同样 100 条文档
+    **23.0s vs 新实例 5.2s（4.4 倍）**；16 条 10-token 小文档 2.9s vs 71ms（**41 倍**）；
+    RSS 4.3GB → 9.8GB。**修复 = 重启 + 启动参数加 `--cache-ram 0`**（禁用 prompt cache，
+    对 rerank/embedding 没有损失：实测新实例 100 条文档仍是 5.2s）。重启后单条 search 的
+    rerank 段 8.1s → 1.1s（离线复现 8.53s → 1.53s）。**判定「模型是否在 GPU 上」别只看 GPU 占用**：
+    两个服务都 `-ngl 99`、llama-bench 也是 GPU 15.9k tok/s vs CPU 6.6k，问题从来不在卡上。
+    启动命令与验证脚本见 `docs/session-2026-10-16-server-degradation.md`。
+51. **超长 query 不能回 422，要降级成「不 rerank 的检索」**（2026-10-16 修）。平台的
+    **文档 grounded 题**会把整篇文档当 query 发（实测一批 24 道：13,816~185,627 字符），
+    旧代码在 `rerank_query_cost > max_query_proxy_tokens(6144)` 时直接 422 → 调用方一条证据
+    都拿不到（那批题在我们的库里也确实只有 1 条 ~1KB 的消息，属于第 40 条的死结家族，但
+    协议上不该报错，而且每个 422 还会占着 search 槽位最长 68s 才吐出来，把队列堵死）。
+    现在：超预算时**跳过 rerank、把 query 首尾截断到 `embedding.input_proxy_tokens` 只供检索**
+    （`clip_middle`，头尾各留一半——文档题的提问在头也在尾），返回融合排序的证据，
+    日志 `strategy=hybrid_retrieval_unreranked` + `rerank_skipped=query_over_budget`。
+    **正文与入库内容永远不动**（截断只用于 embedding/词法通道）。实测同一个 35,522 字符的
+    真实 query：改前 422（68s），改后 200 / 0.96s / 1 条证据。
 
 ## 本机环境的坑
 

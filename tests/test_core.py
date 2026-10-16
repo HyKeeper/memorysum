@@ -477,3 +477,18 @@ def test_chunk_metadata_lifts_the_streaming_task_index():
     )
     assert parse_chunk_metadata(payload).identifiers == ("ALF#86", "86")
     assert parse_chunk_metadata("no payload here").identifiers == ()
+
+
+def test_clip_middle_keeps_both_ends_within_budget():
+    """A document-grounded query carries the question at one of its ends."""
+    from memorysum.core.text import clip_middle, reader_token_count
+
+    head = "HEAD-MARKER " + "alpha " * 4000
+    tail = "omega " * 4000 + " TAIL-MARKER"
+    text = head + tail
+    clipped = clip_middle(text, 2048)
+    assert reader_token_count(clipped) <= 2048
+    assert clipped.startswith("HEAD-MARKER")
+    assert clipped.endswith("TAIL-MARKER")
+    # Texts already inside the budget must come back untouched.
+    assert clip_middle("short text", 2048) == "short text"

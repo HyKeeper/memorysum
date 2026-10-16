@@ -84,6 +84,40 @@ def reader_token_count(text: str, encoding_name: str = "cl100k_base") -> int:
     return len(_encoding(encoding_name).encode(text, disallowed_special=()))
 
 
+#: Marker between the head and the tail of a clipped query. Retrieval-only input: it never
+#: reaches the response body or the stored原文.
+CLIP_SEPARATOR = "\n…\n"
+
+
+def clip_middle(text: str, max_proxy_tokens: int, *, head_ratio: float = 0.5) -> str:
+    """Trim an over-long text to a proxy-token budget, keeping both its head and its tail.
+
+    Document-grounded questions arrive with the whole document glued to the question
+    (measured 13k-186k chars) and the question sits at either end, so keeping one side
+    only silently drops it. Both sides are trimmed conservatively: token counts are not
+    linear in characters (CJK is ~0.6 tokens/char, URL-heavy English ~1.5), so each side
+    is re-measured and shrunk until it fits its share.
+    """
+    if max_proxy_tokens <= 0 or not text:
+        return text
+    total = reader_token_count(text)
+    if total <= max_proxy_tokens:
+        return text
+    head_budget = max(1, int(max_proxy_tokens * head_ratio))
+    tail_budget = max(1, max_proxy_tokens - head_budget)
+    head = text[: int(len(text) * head_budget / total)]
+    tail = text[-int(len(text) * tail_budget / total) :]
+    while head and reader_token_count(head) > head_budget:
+        head = head[: int(len(head) * 0.9)]
+    while tail and reader_token_count(tail) > tail_budget:
+        tail = tail[-int(len(tail) * 0.9) :]
+    if not head:
+        return tail
+    if not tail:
+        return head
+    return head + CLIP_SEPARATOR + tail
+
+
 def query_options_text(query: str, options: list[str] | None) -> str:
     if not options:
         return query
