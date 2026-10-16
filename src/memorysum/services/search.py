@@ -223,27 +223,41 @@ class SearchService:
         rerank_query_cost = reader_token_count(
             self._pipeline.reranker.instruction + "\n" + question_text
         )
-        # A query that cannot fit the reranker's input budget must still be served. The
-        # platform's document-grounded questions arrive as a whole document glued to the
-        # question (observed: 13k-186k chars in one round), and answering them with 422
-        # threw away every piece of evidence we already hold. Those queries skip the
-        # reranker (which cannot score any pair at that size anyway) and are clipped for
-        # the retrieval channels only -- the stored原文 and the response stay verbatim.
-        rerank_allowed = rerank_query_cost <= self._pipeline.reranker.max_query_proxy_tokens
+        # Document-grounded questions arrive as a whole document glued to the question
+        # (observed 13k-186k chars in one round). They must still be served, and each
+        # stage gets the largest slice it can actually accept:
+        #   * the retrieval channels are clipped to the embedding input budget -- only a
+        #     truncated *copy* is embedded / matched, the query itself is never edited;
+        #   * the reranker is handed a clip sized so that even the largest candidate
+        #     group still fits a single pair, which keeps every candidate rerankable
+        #     instead of dropping the stage (and with it the ordering signal) outright.
+        # Only when even that clip cannot fit a pair does the pipeline fall back to the
+        # fusion-only order -- the same path any other over-budget candidate takes.
         retrieval_query = request.query
-        if not rerank_allowed:
-            logger.warning(
-                "Query over the reranker input budget (%d > %d proxy tokens); "
-                "returning fusion-ranked evidence without reranking",
-                rerank_query_cost,
-                self._pipeline.reranker.max_query_proxy_tokens,
-            )
-            diagnostics["rerank_skipped"] = "query_over_budget"
-            diagnostics["rerank_query_tokens"] = rerank_query_cost
+        retrieval_query_cost = reader_token_count(request.query)
+        if retrieval_query_cost > self._pipeline.embedding.input_proxy_tokens:
             retrieval_query = clip_middle(
                 request.query, self._pipeline.embedding.input_proxy_tokens
             )
+            diagnostics["retrieval_query_clipped"] = True
             diagnostics["retrieval_query_chars"] = len(retrieval_query)
+            logger.warning(
+                "Query over the embedding input budget (%d > %d proxy tokens); "
+                "retrieval runs on a head+tail clip of it",
+                retrieval_query_cost,
+                self._pipeline.embedding.input_proxy_tokens,
+            )
+        rerank_question = question_text
+        if rerank_query_cost > self._pipeline.reranker.max_query_proxy_tokens:
+            rerank_question = clip_middle(question_text, self._rerank_clip_budget())
+            diagnostics["rerank_query_clipped"] = True
+            diagnostics["rerank_query_chars"] = len(rerank_question)
+            logger.warning(
+                "Query over the reranker input budget (%d > %d proxy tokens); "
+                "reranking against a head+tail clip of it",
+                rerank_query_cost,
+                self._pipeline.reranker.max_query_proxy_tokens,
+            )
 
         result_cache_key = self._result_cache_key(scope_key, snapshot.epoch, request, options)
         cached = self._results.get(result_cache_key)
@@ -271,6 +285,7 @@ class SearchService:
                 request,
                 options,
                 wide_mode,
+                rerank_question=rerank_question,
             )
             if entries is not None:
                 diagnostics["strategy"] = "full_bundle"
@@ -280,7 +295,9 @@ class SearchService:
                 diagnostics["rerank_pair_tokens_est"] = sum(
                     entry.pair_proxy_tokens for entry in entries
                 )
-                ranked = self._rank_entries(entries, request.query, options, deadline)
+                ranked = self._rank_entries(
+                    entries, request.query, options, deadline, rerank_question=rerank_question
+                )
                 response = self._select_output(
                     ranked, request.top_k, mode, question_cost, request.query
                 )
@@ -339,17 +356,17 @@ class SearchService:
             ),
         )
         diagnostics["candidate_windows"] = len(fused)
-        # A query over the reranker budget cannot score any pair, so the entries are built
-        # without the pair limits (and without the per-pair token accounting, which would
-        # re-encode the whole document once per candidate).
-        entries = (
-            self._prepare_rerank_entries(fused, rows, request, options, wide_mode)
-            if rerank_allowed
-            else []
+        # The pair rules decide which candidates can be scored; a query over the reranker
+        # budget arrives here already clipped to a size that keeps groups rerankable, so
+        # an empty scored list now means "no pair fits at all".
+        entries, leftover = self._prepare_rerank_entries(
+            fused, rows, request, options, wide_mode, rerank_question=rerank_question
         )
         diagnostics["reranked"] = self._pipeline.reranker.enabled
         diagnostics["rerank_groups"] = len(entries)
         diagnostics["rerank_pair_tokens_est"] = sum(entry.pair_proxy_tokens for entry in entries)
+        if leftover:
+            diagnostics["unreranked_candidates"] = len(leftover)
         if not entries:
             if not fused:
                 diagnostics["returned_records"] = 0
@@ -357,25 +374,21 @@ class SearchService:
                 self._database.assert_scope_active(request.user_id)
                 self._results.set(result_cache_key, response)
                 return response
-            # Nothing can be scored: either every candidate pair is over the rerank budget,
-            # or the query itself is (document-grounded questions). Returning `data=[]`
-            # would tell the caller "no relevant memory" when the evidence is right there,
-            # so fall back to the fusion order (the same ranking the pipeline uses with
-            # `reranker.enabled=false`). The strategy string and the warning keep the
-            # skipped rerank visible in the audit log.
-            if rerank_allowed:
-                logger.warning(
-                    "No rerankable pair in scope %s (query %d proxy tokens > budget %d)",
-                    reference.scope_key[:12],
-                    rerank_query_cost,
-                    self._pipeline.reranker.single_pair_proxy_tokens,
-                )
+            # Nothing can be scored: every candidate pair is over the rerank budget.
+            # Returning `data=[]` would tell the caller "no relevant memory" when the
+            # evidence is right there, so fall back to the fusion order (the same ranking
+            # the pipeline uses with `reranker.enabled=false`). The strategy string and
+            # the warning keep the skipped rerank visible in the audit log.
+            logger.warning(
+                "No rerankable pair in scope %s (query %d proxy tokens > budget %d)",
+                reference.scope_key[:12],
+                rerank_query_cost,
+                self._pipeline.reranker.single_pair_proxy_tokens,
+            )
+            diagnostics["rerank_skipped"] = "no_pair_within_budget"
             diagnostics["strategy"] = "hybrid_retrieval_unreranked"
             diagnostics["reranked"] = False
-            entries = self._prepare_rerank_entries(
-                fused, rows, request, options, wide_mode, enforce_pair_limits=False
-            )
-            ranked = [(entry, entry.candidate.score) for entry in entries]
+            ranked = [(entry, entry.candidate.score) for entry in leftover]
             response = self._select_output(
                 ranked, request.top_k, mode, question_cost, request.query
             )
@@ -385,7 +398,14 @@ class SearchService:
             self._results.set(result_cache_key, response)
             return response
 
-        ranked = self._rank_entries(entries, request.query, options, deadline)
+        ranked = self._rank_entries(
+            entries,
+            request.query,
+            options,
+            deadline,
+            rerank_question=rerank_question,
+            leftover=leftover,
+        )
         response = self._select_output(ranked, request.top_k, mode, question_cost, request.query)
         diagnostics["returned_records"] = len(response.data)
         diagnostics["returned_chars"] = sum(len(item.content) for item in response.data)
@@ -469,6 +489,8 @@ class SearchService:
         request: SearchRequest,
         options: Sequence[str],
         wide_mode: bool,
+        *,
+        rerank_question: str | None = None,
     ) -> list[RerankEntry] | None:
         max_groups = (
             self._pipeline.reranker.wide_candidate_groups
@@ -483,7 +505,8 @@ class SearchService:
         if not messages or len(messages) > max_groups:
             return None
 
-        rerank_question = query_options_text(request.query, list(options) if options else None)
+        if rerank_question is None:
+            rerank_question = query_options_text(request.query, list(options) if options else None)
         rendered_messages = render_full_bundle(messages)
         entries: list[RerankEntry] = []
         spent = 0
@@ -990,13 +1013,13 @@ class SearchService:
         options: Sequence[str],
         wide_mode: bool,
         *,
-        enforce_pair_limits: bool = True,
-    ) -> list[RerankEntry]:
-        """Render candidates into rerank entries.
+        rerank_question: str | None = None,
+    ) -> tuple[list[RerankEntry], list[RerankEntry]]:
+        """Render candidates into (rerankable, over-budget) entries.
 
-        `enforce_pair_limits=False` keeps every candidate regardless of the per-pair /
-        total-pair / group budget; that is for the fusion-only fallback, where no rerank
-        request is made and the budgets therefore do not apply.
+        The second list holds the candidates the pair budgets exclude: the reranker
+        cannot score them, but they are still evidence, so the caller keeps them in
+        fusion order behind the scored records instead of dropping them silently.
         """
         max_groups = (
             self._pipeline.reranker.wide_candidate_groups
@@ -1008,7 +1031,8 @@ class SearchService:
             if wide_mode
             else self._pipeline.reranker.ordinary_pair_proxy_budget
         )
-        rerank_question = query_options_text(request.query, list(options) if options else None)
+        if rerank_question is None:
+            rerank_question = query_options_text(request.query, list(options) if options else None)
         candidates_by_view: dict[str, RerankEntry] = {}
         groups = self._group_overlapping_candidates(fused, rows)
         for group in groups:
@@ -1021,18 +1045,14 @@ class SearchService:
                 primary_span.get("source_timestamp_ms"),
                 primary_span.get("request_received_ms"),
             )
-            # The per-pair token accounting exists to enforce the rerank budgets. The
-            # fusion-only fallback sends no rerank request, so skip the re-encoding: it
-            # would tokenize the full query once per candidate, and for a query at the
-            # document-grounded scale (tens of thousands of characters) that alone costs
-            # seconds.
-            pair_cost = 0
-            if enforce_pair_limits:
-                pair_text = (
-                    f"<Instruct>: {self._pipeline.reranker.instruction}\n"
-                    f"<Query>: {rerank_question}\n<Document>: {rerank_content}"
-                )
-                pair_cost = reader_token_count(pair_text)
+            # The per-pair token accounting exists to enforce the rerank budgets. Even the
+            # over-budget (leftover) entries need it -- that is the number that decides
+            # they are over budget -- so it is always computed.
+            pair_text = (
+                f"<Instruct>: {self._pipeline.reranker.instruction}\n"
+                f"<Query>: {rerank_question}\n<Document>: {rerank_content}"
+            )
+            pair_cost = reader_token_count(pair_text)
             existing = candidates_by_view.get(view_id)
             if existing is None or candidate.score > existing.candidate.score:
                 candidates_by_view[view_id] = RerankEntry(
@@ -1056,21 +1076,40 @@ class SearchService:
                 entry.candidate.window_id,
             ),
         )
-        if not enforce_pair_limits:
-            return ordered
         selected: list[RerankEntry] = []
+        leftover: list[RerankEntry] = []
         spent = 0
         for entry in ordered:
             cost = entry.pair_proxy_tokens
-            if cost > self._pipeline.reranker.single_pair_proxy_tokens:
-                continue
-            if spent + cost > pair_budget:
+            if (
+                cost > self._pipeline.reranker.single_pair_proxy_tokens
+                or spent + cost > pair_budget
+            ):
+                # Over the pair budget: unscored, but still delivered (see docstring).
+                leftover.append(entry)
                 continue
             selected.append(entry)
             spent += cost
             if len(selected) >= max_groups:
                 break
-        return selected
+        return selected, leftover
+
+    def _rerank_clip_budget(self) -> int:
+        """Largest query clip that still leaves room for the biggest candidate group.
+
+        `reranker.single_pair_proxy_tokens` bounds a whole (query, document) pair; the
+        document side is bounded by the group budgets (`groups.direct_max_tokens` /
+        `groups.context_max_tokens`) plus the rendering prefix. Clipping the query to
+        what is left keeps every candidate inside the pair budget, so an over-long
+        query loses rerank *resolution* only -- never candidates.
+        """
+        render_allowance = 128
+        return max(
+            512,
+            self._pipeline.reranker.single_pair_proxy_tokens
+            - self._pipeline.groups.context_max_tokens
+            - render_allowance,
+        )
 
     def _rank_entries(
         self,
@@ -1078,6 +1117,9 @@ class SearchService:
         query: str,
         options: Sequence[str],
         deadline: float,
+        *,
+        rerank_question: str | None = None,
+        leftover: Sequence[RerankEntry] = (),
     ) -> list[tuple[RerankEntry, float]]:
         """Order entries: ranked by the reranker when enabled, else by fusion.
 
@@ -1088,10 +1130,21 @@ class SearchService:
         showed pure rerank ordering is unstable across query halves.
         """
         if not self._pipeline.reranker.enabled:
-            return [(entry, entry.candidate.score) for entry in entries]
-        rerank_query = self._rerank_query(query, options)
-        scores = self._rerank_entries(rerank_query, entries, deadline)
-        return self._fuse_rankings(entries, scores, query)
+            return [(entry, entry.candidate.score) for entry in entries] + [
+                (entry, entry.candidate.score) for entry in leftover
+            ]
+        question = (
+            rerank_question
+            if rerank_question is not None
+            else query_options_text(query, list(options) if options else None)
+        )
+        scores = self._rerank_entries(self._rerank_query_text(question), entries, deadline)
+        # Candidates the pair budgets excluded keep their fusion order behind the scored
+        # ones: a query too large to rerank everything still delivers the full evidence
+        # set (the response budget decides how far down the tail it actually reaches).
+        return self._fuse_rankings(entries, scores, query) + [
+            (entry, entry.candidate.score) for entry in leftover
+        ]
 
     def _fuse_rankings(
         self,
@@ -1381,6 +1434,9 @@ class SearchService:
 
     def _rerank_query(self, query: str, options: Sequence[str]) -> str:
         question = query_options_text(query, list(options) if options else None)
+        return self._rerank_query_text(question)
+
+    def _rerank_query_text(self, question: str) -> str:
         instruction = self._pipeline.reranker.instruction.strip()
         if not instruction:
             # Cross-encoders such as bge-reranker take a bare query; only models

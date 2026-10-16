@@ -741,13 +741,14 @@ def test_time_anchor_scope_all_covers_non_temporal_questions(tmp_path):
     assert "Session" not in line, "没有 session 号时不该留空壳"
 
 
-def test_over_long_query_is_served_without_rerank_instead_of_422(tmp_path, caplog):
-    """A query past the reranker budget must still return evidence.
+def test_over_long_query_is_served_and_still_reranked_from_a_clip(tmp_path, caplog):
+    """A query past the reranker budget must still return evidence -- and keep reranking.
 
     The platform's document-grounded questions send the whole document as the query
     (measured 13k-186k chars). Those requests used to be rejected with 422 and the
-    caller saw no evidence at all; now they skip the reranker, clip the query for the
-    retrieval channels, and return the fusion-ranked records.
+    caller saw no evidence at all. Now each stage gets the largest slice it can accept:
+    the retrieval channels are clipped to the embedding input budget, and the reranker
+    is clipped to a size that still leaves room for a candidate pair.
     """
     import logging
 
@@ -784,7 +785,89 @@ def test_over_long_query_is_served_without_rerank_instead_of_422(tmp_path, caplo
         )
     assert searched.status_code == 200, searched.text
     assert searched.json()["data"], "the evidence must come back, not a 422"
-    assert provider.rerank_batches == [], "a query that cannot fit any pair must not rerank"
-    assert any("over the reranker input budget" in record.message for record in caplog.records)
     (embedding_input,) = provider.embedding_batches[-1]
     assert len(embedding_input) < len(huge_query), "the retrieval query must be clipped"
+    # The reranker still runs -- against the clipped question, never the raw document.
+    assert provider.rerank_batches, "the ordering signal must not be dropped wholesale"
+    rerank_query = provider.rerank_batches[0][0]
+    assert 0 < len(rerank_query) < len(huge_query)
+    assert any("over the reranker input budget" in record.message for record in caplog.records)
+
+
+def test_over_long_query_falls_back_to_fusion_when_even_the_clip_cannot_fit(tmp_path, caplog):
+    """When no clipped pair fits the single-pair budget, fusion order is the fallback."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="memorysum.services.search")
+    provider = FakeProvider()
+    app = make_app(
+        tmp_path / "data",
+        provider,
+        reranker_overrides={"max_query_proxy_tokens": 4, "single_pair_proxy_tokens": 1},
+    )
+    payload = {
+        "request_id": "add-huge-2",
+        "user_id": "huge-query-user-2",
+        "session_id": "session-1",
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": 1704067200000,
+                "content": "I prefer tea in the morning because it keeps me calm.",
+            }
+        ],
+    }
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        assert client.post("/add", json=payload).status_code == 200
+        provider.rerank_batches.clear()
+        searched = client.post(
+            "/search",
+            json={"query": "tea " * 6000, "user_id": "huge-query-user-2", "top_k": 5},
+        )
+    assert searched.status_code == 200, searched.text
+    assert searched.json()["data"]
+    assert provider.rerank_batches == [], "no pair fits, so the reranker must not be called"
+    assert any("No rerankable pair" in record.message for record in caplog.records)
+
+
+def test_over_budget_candidates_are_still_delivered(tmp_path):
+    """A candidate the pair budget excludes is not silently dropped from the response.
+
+    Before, an unscored candidate simply vanished from the output; when the query is
+    large every pair is expensive, so that could shrink a 90-record response to a
+    handful. The excluded candidates now keep their fusion order behind the scored ones.
+    """
+    provider = FakeProvider()
+    app = make_app(
+        tmp_path / "data",
+        provider,
+        reranker_overrides={"single_pair_proxy_tokens": 120},
+    )
+    payload = {
+        "request_id": "add-leftover",
+        "user_id": "leftover-user",
+        "session_id": "session-1",
+        "messages": [
+            {"role": "user", "timestamp": 1704067200000, "content": "I prefer tea."},
+            *[
+                {
+                    "role": "user",
+                    "timestamp": 1704067200000 + index,
+                    "content": f"Note {index}: " + "coffee and tea are both fine " * 40,
+                }
+                for index in range(4)
+            ],
+        ],
+    }
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        assert client.post("/add", json=payload).status_code == 200
+        provider.rerank_batches.clear()
+        searched = client.post(
+            "/search",
+            json={"query": "What do I prefer?", "user_id": "leftover-user", "top_k": 10},
+        )
+    assert searched.status_code == 200, searched.text
+    data = searched.json()["data"]
+    scored = sum(len(documents) for _, documents in provider.rerank_batches)
+    assert scored >= 1, "the affordable pair must still be scored"
+    assert len(data) > scored, "candidates over the pair budget must still be delivered"

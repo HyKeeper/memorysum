@@ -202,16 +202,24 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
     rerank 段 8.1s → 1.1s（离线复现 8.53s → 1.53s）。**判定「模型是否在 GPU 上」别只看 GPU 占用**：
     两个服务都 `-ngl 99`、llama-bench 也是 GPU 15.9k tok/s vs CPU 6.6k，问题从来不在卡上。
     启动命令与验证脚本见 `docs/session-2026-10-16-server-degradation.md`。
-51. **超长 query 不能回 422，要降级成「不 rerank 的检索」**（2026-10-16 修）。平台的
-    **文档 grounded 题**会把整篇文档当 query 发（实测一批 24 道：13,816~185,627 字符），
-    旧代码在 `rerank_query_cost > max_query_proxy_tokens(6144)` 时直接 422 → 调用方一条证据
-    都拿不到（那批题在我们的库里也确实只有 1 条 ~1KB 的消息，属于第 40 条的死结家族，但
-    协议上不该报错，而且每个 422 还会占着 search 槽位最长 68s 才吐出来，把队列堵死）。
-    现在：超预算时**跳过 rerank、把 query 首尾截断到 `embedding.input_proxy_tokens` 只供检索**
-    （`clip_middle`，头尾各留一半——文档题的提问在头也在尾），返回融合排序的证据，
-    日志 `strategy=hybrid_retrieval_unreranked` + `rerank_skipped=query_over_budget`。
-    **正文与入库内容永远不动**（截断只用于 embedding/词法通道）。实测同一个 35,522 字符的
-    真实 query：改前 422（68s），改后 200 / 0.96s / 1 条证据。
+51. **超长 query 不能回 422：按「每个环节各取放得下的最大一份」降级**（2026-10-16 修）。平台的
+    **文档 grounded 题**把整篇文档当 query 发（实测一批 24 道：13,816~185,627 字符），旧代码在
+    `rerank_query_cost > max_query_proxy_tokens(6144)` 时直接 422 → 调用方一条证据都拿不到
+    （那批题在我们库里也确实只有 1 条 ~1KB 消息，属第 40 条的死结家族；但协议上不该报错，
+    且每个 422 还占着 search 槽位最长 68s 才吐出来，把队列堵死）。现在的规则：
+    - **检索通道**（dense+词法）用 `clip_middle(query, embedding.input_proxy_tokens)` 的**首尾各一半**
+      截断副本（文档题的提问可能贴在头、也可能贴在尾——实测 185k 字符那道题的问题就在最后一行）；
+      截断只用于检索输入，**入库原文与响应正文永远不动**。
+    - **精排**用 `clip_middle(question, single_pair_proxy_tokens - context_max_tokens - 128)`，
+      即「最大分组仍能塞进单对预算」的尺寸，再交给既有的逐对预算规则决定给哪些候选打分。
+    - **对预算外候选不再静默丢弃**：`_prepare_rerank_entries` 现在返回
+      `(可精排, 超预算)` 两份，超预算的按融合次序接在精排结果**后面**返回——这是普遍的覆盖修复，
+      不只针对超长 query。实测同一个 42k 字符 query（真实 scope，295 个候选）：只裁不接 → 只返回
+      **19** 条；接上 leftover → 返回 **100** 条（与正常 query 同量级）+ 顶部 20 条带精排信号。
+    - 截断切口落在**文本单元边界**（句号/换行/空格，`_snap_inward`），不会把半个词丢给 embedding。
+    **实测**（真实 query）：35,522 字符 → 422/68.4s 变 200/0.96s；42k 字符在大 scope 上 6.6s/100 条；
+    小 scope 的文档题 0.14~0.28s。诊断：`rerank_query_clipped` / `retrieval_query_clipped` /
+    `unreranked_candidates`；真一个对都塞不进时仍走 `hybrid_retrieval_unreranked` + WARNING。
 
 ## 本机环境的坑
 

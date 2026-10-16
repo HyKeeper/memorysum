@@ -492,3 +492,18 @@ def test_clip_middle_keeps_both_ends_within_budget():
     assert clipped.endswith("TAIL-MARKER")
     # Texts already inside the budget must come back untouched.
     assert clip_middle("short text", 2048) == "short text"
+
+
+def test_clip_middle_cuts_on_text_unit_boundaries():
+    """The clip must not hand the embedding model half a word or half a sentence."""
+    from memorysum.core.text import CLIP_SEPARATOR, clip_middle
+
+    text = ("First sentence about the colony. " * 200) + ("Last question: how many rods? " * 200)
+    clipped = clip_middle(text, 400)
+    head, _, tail = clipped.partition(CLIP_SEPARATOR)
+    assert head.endswith("."), head[-40:]
+    assert tail.startswith("Last") or tail.startswith("question") or tail.startswith("how"), tail[
+        :40
+    ]
+    assert not head.endswith("colon")  # never a partial word
+    assert clip_middle("no boundary search needed", 100) == "no boundary search needed"

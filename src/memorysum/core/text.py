@@ -88,6 +88,31 @@ def reader_token_count(text: str, encoding_name: str = "cl100k_base") -> int:
 #: reaches the response body or the stored原文.
 CLIP_SEPARATOR = "\n…\n"
 
+#: Characters that end a text unit; a clip prefers to cut right after one of these so the
+#: embedded copy never starts or ends mid-word (CJK text has few of them, so the plain
+#: character cut is the fallback).
+_CLIP_BOUNDARIES = ("\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", "；", "; ", " ")
+
+
+def _snap_inward(piece: str, *, from_end: bool) -> str:
+    """Cut an already-sized slice to a text-unit boundary (only ever shortens it).
+
+    The boundary search stays inside the slice, so a caller's token budget is never
+    exceeded by the snap; the caller re-measures anyway because token counts are not
+    linear in characters.
+    """
+    if not piece:
+        return piece
+    window = min(200, len(piece))
+    probe = piece[:window] if from_end else piece[-window:]
+    for boundary in _CLIP_BOUNDARIES:
+        index = probe.find(boundary) if from_end else probe.rfind(boundary)
+        if index >= 0:
+            cut = index + len(boundary)
+            piece = piece[cut:] if from_end else piece[: len(piece) - len(probe) + cut]
+            break
+    return piece.strip()
+
 
 def clip_middle(text: str, max_proxy_tokens: int, *, head_ratio: float = 0.5) -> str:
     """Trim an over-long text to a proxy-token budget, keeping both its head and its tail.
@@ -96,7 +121,8 @@ def clip_middle(text: str, max_proxy_tokens: int, *, head_ratio: float = 0.5) ->
     (measured 13k-186k chars) and the question sits at either end, so keeping one side
     only silently drops it. Both sides are trimmed conservatively: token counts are not
     linear in characters (CJK is ~0.6 tokens/char, URL-heavy English ~1.5), so each side
-    is re-measured and shrunk until it fits its share.
+    is re-measured and shrunk until it fits its share. The unit snapping happens last so
+    that neither shrink step can leave a half word or a half sentence in the clip.
     """
     if max_proxy_tokens <= 0 or not text:
         return text
@@ -111,6 +137,8 @@ def clip_middle(text: str, max_proxy_tokens: int, *, head_ratio: float = 0.5) ->
         head = head[: int(len(head) * 0.9)]
     while tail and reader_token_count(tail) > tail_budget:
         tail = tail[-int(len(tail) * 0.9) :]
+    head = _snap_inward(head, from_end=False)
+    tail = _snap_inward(tail, from_end=True)
     if not head:
         return tail
     if not tail:
