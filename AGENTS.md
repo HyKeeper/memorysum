@@ -26,16 +26,14 @@
 - qinstr2（新 query instruction）→ 已回退到旧指令
 - chunk512（大窗口）→ 已回退到 leaf 256 / context 320
 
-**2026-10-17 起的检索/内容参数**（config `20696a50d0b6…`；full 52.27 之后，尚未经平台验证）：
+**2026-10-17 起的检索/内容参数（保守版，config `1aeb5e55…`；full 52.27 之后，尚未经平台验证）**：
 - `reranker.fusion_weight` 2.0 → **3.0**；`retrieval.neighbor_expand_chars` 0 → **600**；
 - `groups.prepend_document_title=true`（窗口丢了同一消息的 `Document title:` 时逐字补回）；
-- `groups.feedback_policy=demote_other`（别的题的 QA feedback 移到正文后，**本题 feedback 原位**；
-  streaming top-10 feedback 占比 82%→31%，本地代理无 feedback 故测不到收益）；
+- `groups.feedback_policy=off`（**保守选择：只启用三项有本地分数支撑的改动**；`demote_other`
+  的代码保留但未启用 —— 它只改变返回顺序，本地代理无 feedback 测不到收益，等平台轮单独验证）；
 - `retrieval.prf.enabled=false`（四路 PRF 已实现并实测：200 题代理 53.0%，中性，未上车）。
-- 本地代理：基线 53.0–53.5%（106/107），改动后 **56.0–56.5%（112/113）**，两次重复分布不重叠、
+- 本地代理：基线 53.0–53.5%（106/107），三项改动后 **56.0–56.5%（112/113）**，两次重复分布不重叠、
   逐族同向；配对 McNemar 9 赢/3 输（p≈0.146，仍未到 0.05）。平台 full 未重跑（30 天锁）。
-  其中 `feedback_policy` 在本地代理上是 no-op（代理集无 feedback），只有组成证据；
-  有本地分数支撑的是 `fusion_weight / neighbor_expand_chars / prepend_document_title`。
   详见 `docs/session-2026-10-17.md`。
 
 ## 环境与运行

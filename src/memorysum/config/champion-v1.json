@@ -113,7 +113,7 @@
     "time_anchor_in_text": true,
     "time_anchor_scope": "temporal",
     "time_anchor_template": "Session {session} ({date})",
-    "feedback_policy": "demote_other",
+    "feedback_policy": "off",
     "prepend_document_title": true,
     "full_message_records": 0,
     "full_message_chars": 3000
