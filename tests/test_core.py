@@ -507,3 +507,58 @@ def test_clip_middle_cuts_on_text_unit_boundaries():
     ]
     assert not head.endswith("colon")  # never a partial word
     assert clip_middle("no boundary search needed", 100) == "no boundary search needed"
+
+
+def _feedback_entry(content: str, window_id: int) -> object:
+    from memorysum.core.ranking import FusedCandidate
+    from memorysum.services.search import RerankEntry
+
+    return RerankEntry(
+        candidate=FusedCandidate(window_id=window_id),
+        view_id=f"view-{window_id}",
+        rerank_content=content,
+        response_content=content,
+        spans=[],
+        created_at_ms=0,
+        pair_proxy_tokens=1,
+        source_ids=[],
+        anchor=None,
+        session=None,
+    )
+
+
+def test_feedback_question_parses_only_platform_feedback_records():
+    from memorysum.services.search import _feedback_question
+
+    record = (
+        "Streaming online QA feedback:\n"
+        '{"method": "locomo_llm_judge", "predicted_answer": "A \\"quoted\\" answer", '
+        '"qa_id": "locomo5:q0001:step02", "question": "What does Audrey do?", "score": 0.0}'
+    )
+    assert _feedback_question(record) == "What does Audrey do?"
+    assert _feedback_question("Juror #3: Not guilty.") is None
+    assert _feedback_question("Streaming online QA feedback: not-json") is None
+
+
+def test_feedback_policy_keeps_own_feedback_and_demotes_other_questions():
+    from memorysum.services.search import SearchService
+
+    service = SearchService.__new__(SearchService)
+    pipeline = load_pipeline_config()
+    service._pipeline = pipeline.model_copy(
+        update={"groups": pipeline.groups.model_copy(update={"feedback_policy": "demote_other"})}
+    )
+    own = _feedback_entry(
+        'Streaming online QA feedback: {"question": "What is A?", "score": 0.0}', 1
+    )
+    foreign = _feedback_entry(
+        'Streaming online QA feedback: {"question": "What is B?", "score": 1.0}', 2
+    )
+    plain = _feedback_entry("source evidence line", 3)
+    diagnostics: dict[str, object] = {}
+    ordered = service._apply_feedback_policy(
+        [(own, 0.9), (plain, 0.8), (foreign, 0.7)], "What is A?", diagnostics
+    )
+    assert [entry.candidate.window_id for entry, _ in ordered] == [1, 3, 2]
+    assert diagnostics["feedback_demoted"] == 1
+    assert diagnostics["feedback_kept"] == 2

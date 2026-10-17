@@ -13,7 +13,7 @@
   },
   "reranker": {
     "enabled": true,
-    "fusion_weight": 2.0,
+    "fusion_weight": 3.0,
     "provider": "local-openai",
     "model": "bge-reranker-v2-m3",
     "instruction": "",
@@ -24,7 +24,8 @@
     "ordinary_candidate_groups": 100,
     "wide_candidate_groups": 100,
     "batch_groups": 16,
-    "max_concurrency": 4
+    "max_concurrency": 4,
+    "include_options": true
   },
   "chunking": {
     "leaf": {
@@ -71,7 +72,30 @@
       "output_records": 100,
       "output_tokens": 98304
     },
-    "neighbor_expand_chars": 0,
+    "neighbor_expand_chars": 600,
+    "neighbor_message_chars": 0,
+    "prf": {
+      "enabled": false,
+      "min_top_k": 30,
+      "dense": {
+        "enabled": true,
+        "seed_docs": 16,
+        "neighbors": 64,
+        "weight": 0.6,
+        "query_mix": 0.0,
+        "min_seeds": 4
+      },
+      "lexical": {
+        "enabled": true,
+        "seed_docs": 8,
+        "max_terms": 8,
+        "neighbors": 32,
+        "weight": 0.3,
+        "min_term_length": 4,
+        "max_seed_df_ratio": 0.6
+      },
+      "lexical_zh": true
+    },
     "channel_consensus_bonus": 0.0,
     "similarity_weight": 0.0,
     "consensus_weight": 0.0,
@@ -88,7 +112,11 @@
     "normalize_whitespace": false,
     "time_anchor_in_text": true,
     "time_anchor_scope": "temporal",
-    "time_anchor_template": "Session {session} ({date})"
+    "time_anchor_template": "Session {session} ({date})",
+    "feedback_policy": "demote_other",
+    "prepend_document_title": true,
+    "full_message_records": 0,
+    "full_message_chars": 3000
   },
   "coverage": {
     "always_full_tokens": 4096,

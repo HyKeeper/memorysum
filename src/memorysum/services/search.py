@@ -53,9 +53,9 @@ from memorysum.core.text import (
     safe_fts_expression,
     utc_timestamp,
 )
-from memorysum.core.vector import normalize_batch, vector_to_blob
+from memorysum.core.vector import blob_to_vector, normalize_batch, normalize_vector, vector_to_blob
 from memorysum.providers.protocols import ModelProvider
-from memorysum.settings import PipelineConfig, RetrievalModeConfig
+from memorysum.settings import PipelineConfig, PrfDenseConfig, PrfLexicalConfig, RetrievalModeConfig
 from memorysum.storage.database import DatabaseManager, ScopeRef, transaction
 
 logger = logging.getLogger(__name__)
@@ -103,7 +103,10 @@ class RerankEntry:
 
 
 _SPEAKER_RE = re.compile(r"(?m)^([A-Z][a-z]{2,15}):\s")
+_FEEDBACK_MARKER = "Streaming online QA feedback:"
+_FEEDBACK_QUESTION_RE = re.compile(r'"question"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _WORD_RE = re.compile(r"[a-z]{4,}")
+_PRF_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'-]{2,}")
 _STOP = frozenset(
     """about after again against also because been before being below between both
 could doing down during each few from further have having here into itself just like more most
@@ -111,6 +114,44 @@ only other over same should some such than that their them then there these they
 through under until very were what when where which while will with would your yours""".split()
 )
 _WORD_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+_DOCUMENT_TITLE_RE = re.compile(r"(Document title:[^\n]{1,200})")
+
+
+def _document_title(raw: str) -> str | None:
+    match = _DOCUMENT_TITLE_RE.search(raw[:2000])
+    return match.group(1).strip() if match else None
+
+
+def _snap_prefix(text: str) -> str:
+    """Drop a leading partial word left by a tail cut."""
+    cut = text.find(" ")
+    return text[cut + 1 :] if 0 <= cut < 40 else text
+
+
+def _snap_suffix(text: str) -> str:
+    """Drop a trailing partial word left by a head cut."""
+    cut = text.rfind(" ")
+    return text[:cut] if cut > len(text) - 40 else text
+
+
+def _normalised_question(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def _feedback_question(content: str) -> str | None:
+    """Return the question embedded in a platform QA-feedback record, if any."""
+    marker = content.find(_FEEDBACK_MARKER)
+    if marker < 0:
+        return None
+    match = _FEEDBACK_QUESTION_RE.search(content, marker)
+    if match is None:
+        return None
+    try:
+        return json.loads('"' + match.group(1) + '"')
+    except (ValueError, TypeError):
+        return None
 
 
 def _word_re(name: str) -> re.Pattern[str]:
@@ -220,8 +261,9 @@ class SearchService:
         options = request.options or []
         question_text = query_options_text(request.query, options)
         question_cost = reader_token_count(question_text)
+        rerank_text = question_text if self._pipeline.reranker.include_options else request.query
         rerank_query_cost = reader_token_count(
-            self._pipeline.reranker.instruction + "\n" + question_text
+            self._pipeline.reranker.instruction + "\n" + rerank_text
         )
         # Document-grounded questions arrive as a whole document glued to the question
         # (observed 13k-186k chars in one round). They must still be served, and each
@@ -247,9 +289,9 @@ class SearchService:
                 retrieval_query_cost,
                 self._pipeline.embedding.input_proxy_tokens,
             )
-        rerank_question = question_text
+        rerank_question = rerank_text
         if rerank_query_cost > self._pipeline.reranker.max_query_proxy_tokens:
-            rerank_question = clip_middle(question_text, self._rerank_clip_budget())
+            rerank_question = clip_middle(rerank_text, self._rerank_clip_budget())
             diagnostics["rerank_query_clipped"] = True
             diagnostics["rerank_query_chars"] = len(rerank_question)
             logger.warning(
@@ -319,7 +361,7 @@ class SearchService:
         if len(query_vector) != snapshot.dimension:
             raise PipelineMismatch()
 
-        channels, rows = self._retrieve_candidates(
+        channels, rows, main_unique = self._retrieve_candidates(
             reference,
             request.user_id,
             snapshot,
@@ -327,6 +369,7 @@ class SearchService:
             retrieval_query,
             options,
             wide_mode,
+            request.top_k,
         )
         diagnostics["strategy"] = "hybrid_retrieval"
         diagnostics["channel_hits"] = {name: len(ids) for name, ids, _ in channels}
@@ -335,14 +378,9 @@ class SearchService:
         if getattr(self._pipeline.retrieval, "rrf_k_adaptive", False):
             # 按去重前的候选总量缩放 k：RRF 原论文的 k=60 是在 TREC 量级语料上调的，
             # 而这里的候选列表只有几十到几百条 —— 见 docs/round8-prereg.md 的扫描。
-            unique = len(
-                {
-                    int(entry) if not isinstance(entry, (tuple, list)) else int(entry[0])
-                    for _, entries, _ in channels
-                    for entry in entries
-                }
-            )
-            rrf_k = max(10, min(30, unique // 3))
+            # PRF 增量不参与这个计数：它们是被刻意压低权重的探索路，若让它们把 k 推大，
+            # 主路的头部优势会被顺带削掉（那是另一个变量的效应）。
+            rrf_k = max(10, min(30, main_unique // 3))
             diagnostics["rrf_k"] = rrf_k
         fused = reciprocal_rank_fusion(
             channels,
@@ -389,6 +427,7 @@ class SearchService:
             diagnostics["strategy"] = "hybrid_retrieval_unreranked"
             diagnostics["reranked"] = False
             ranked = [(entry, entry.candidate.score) for entry in leftover]
+            ranked = self._apply_feedback_policy(ranked, request.query, diagnostics)
             response = self._select_output(
                 ranked, request.top_k, mode, question_cost, request.query
             )
@@ -406,6 +445,7 @@ class SearchService:
             rerank_question=rerank_question,
             leftover=leftover,
         )
+        ranked = self._apply_feedback_policy(ranked, request.query, diagnostics)
         response = self._select_output(ranked, request.top_k, mode, question_cost, request.query)
         diagnostics["returned_records"] = len(response.data)
         diagnostics["returned_chars"] = sum(len(item.content) for item in response.data)
@@ -607,7 +647,8 @@ class SearchService:
         query: str,
         options: Sequence[str],
         wide_mode: bool,
-    ) -> tuple[list[tuple[str, list[int], float]], dict[int, sqlite3.Row]]:
+        top_k: int = 100,
+    ) -> tuple[list[tuple[str, list[object], float]], dict[int, sqlite3.Row], int]:
         mode = self._pipeline.retrieval.wide if wide_mode else self._pipeline.retrieval.ordinary
         connection = self._database.connect(reference, user_id)
         try:
@@ -659,6 +700,25 @@ class SearchService:
                     ("chinese_fts", zh, weight("chinese_fts")),
                     ("options_lexical", option_ids, weight("options_lexical")),
                 ]
+                # The adaptive RRF k is scaled from the *main* candidate pool only;
+                # expansion increments must not change the main ranking's shape.
+                main_unique = len(
+                    {
+                        int(entry[0]) if isinstance(entry, (tuple, list)) else int(entry)
+                        for _, ids, _ in channels
+                        for entry in ids
+                    }
+                )
+                channels.extend(
+                    self._prf_channels(
+                        connection,
+                        snapshot,
+                        query_vector,
+                        query,
+                        channels,
+                        top_k,
+                    )
+                )
                 # Dense channels yield (window_id, similarity); lexical ones yield
                 # bare ids. Normalise here so both drive the same row fetch.
                 all_ids = sorted(
@@ -669,7 +729,8 @@ class SearchService:
                     }
                 )
                 rows = self._load_window_rows(connection, all_ids, snapshot.epoch)
-            return channels, rows
+                self._attach_message_neighbors(connection, rows)
+            return channels, rows, main_unique
         except (PipelineMismatch, ScopeRetired, ServiceError):
             raise
         except sqlite3.Error as exc:
@@ -677,6 +738,232 @@ class SearchService:
             raise StorageError() from None
         finally:
             connection.close()
+
+    def _prf_channels(
+        self,
+        connection: sqlite3.Connection,
+        snapshot: Snapshot,
+        query_vector: Sequence[float],
+        query: str,
+        main_channels: Sequence[tuple[str, Sequence[object], float]],
+        top_k: int,
+    ) -> list[tuple[str, list[object], float]]:
+        """Four-way recall's two exploration routes (increments only, low weight).
+
+        Route 3 (dense) averages the first-round leaders' own vectors into a
+        centroid and runs a second KNN query with it. Route 4 (lexical) mines
+        terms out of the first-round BM25 leaders and runs a second FTS query.
+        Both routes drop anything the main channels already found and enter the
+        fusion with their own (low) weights, so the original-query ranking keeps
+        its authority -- exactly the risk control described in the PRF note.
+        """
+        config = self._pipeline.retrieval.prf
+        if not config.enabled or top_k < config.min_top_k:
+            return []
+        by_channel: dict[str, list[int]] = {}
+        main_ids: set[int] = set()
+        for name, entries, _ in main_channels:
+            ids = [
+                int(entry[0]) if isinstance(entry, (tuple, list)) else int(entry)
+                for entry in entries
+            ]
+            by_channel[name] = ids
+            main_ids.update(ids)
+
+        extra: list[tuple[str, list[object], float]] = []
+        if config.dense.enabled:
+            seeds: list[int] = []
+            for name in ("leaf_dense", "english_fts"):
+                seeds.extend(by_channel.get(name, [])[: config.dense.seed_docs])
+            seeds = list(dict.fromkeys(seeds))
+            centroid = self._document_centroid(
+                connection, seeds, snapshot.epoch, query_vector, config.dense
+            )
+            if centroid is not None:
+                hits = self._dense_hits(
+                    connection,
+                    "vec_leaf",
+                    centroid,
+                    snapshot.epoch,
+                    config.dense.neighbors,
+                )
+                increments = [(wid, sim) for wid, sim in hits if wid not in main_ids]
+                if increments:
+                    extra.append(("prf_dense", increments, config.dense.weight))
+
+        if config.lexical.enabled:
+            seeds = by_channel.get("english_fts", [])[: config.lexical.seed_docs]
+            terms = self._prf_terms(
+                connection, seeds, snapshot.epoch, query, "lexical_en", config.lexical
+            )
+            if terms:
+                hits = self._fts_expression_hits(
+                    connection,
+                    "fts_en",
+                    safe_fts_expression(terms, limit=config.lexical.max_terms),
+                    snapshot.epoch,
+                    config.lexical.neighbors,
+                )
+                increments = [wid for wid in hits if wid not in main_ids]
+                if increments:
+                    extra.append(("prf_lexical", increments, config.lexical.weight))
+            if config.lexical_zh:
+                zh_seeds = by_channel.get("chinese_fts", [])[: config.lexical.seed_docs]
+                zh_terms = self._prf_terms(
+                    connection,
+                    zh_seeds,
+                    snapshot.epoch,
+                    query,
+                    "lexical_zh",
+                    config.lexical,
+                )
+                if zh_terms:
+                    hits = self._fts_expression_hits(
+                        connection,
+                        "fts_zh",
+                        safe_fts_expression(zh_terms, limit=config.lexical.max_terms),
+                        snapshot.epoch,
+                        config.lexical.neighbors,
+                    )
+                    increments = [wid for wid in hits if wid not in main_ids]
+                    if increments:
+                        extra.append(("prf_lexical_zh", increments, config.lexical.weight))
+        return extra
+
+    def _document_centroid(
+        self,
+        connection: sqlite3.Connection,
+        window_ids: Sequence[int],
+        epoch: int,
+        query_vector: Sequence[float],
+        config: PrfDenseConfig,
+    ) -> list[float] | None:
+        """Mean of the first-round leaders' stored window vectors, normalised."""
+        if not window_ids:
+            return None
+        placeholders = ",".join("?" for _ in window_ids)
+        scales = {
+            int(row["window_id"]): str(row["scale"])
+            for row in connection.execute(
+                f"SELECT window_id, scale FROM windows WHERE window_id IN ({placeholders})",
+                tuple(window_ids),
+            )
+        }
+        vectors: list[list[float]] = []
+        for table, scale in (("vec_leaf", "leaf"), ("vec_context", "context")):
+            ids = [wid for wid in window_ids if scales.get(wid) == scale]
+            if not ids:
+                continue
+            marks = ",".join("?" for _ in ids)
+            for row in connection.execute(
+                f"SELECT rowid, embedding FROM {table} WHERE rowid IN ({marks})",
+                tuple(ids),
+            ):
+                embedding = row["embedding"]
+                if embedding is None:
+                    continue
+                try:
+                    vectors.append(blob_to_vector(bytes(embedding), len(query_vector)))
+                except ValueError:
+                    continue
+        if len(vectors) < config.min_seeds:
+            return None
+        total = [0.0] * len(query_vector)
+        for vector in vectors:
+            unit = normalize_vector(vector)
+            for index, value in enumerate(unit):
+                total[index] += value
+        centroid = normalize_vector(total)
+        mix = float(config.query_mix or 0.0)
+        if mix > 0:
+            query_unit = normalize_vector(query_vector)
+            centroid = normalize_vector(
+                [
+                    (1.0 - mix) * left + mix * right
+                    for left, right in zip(centroid, query_unit, strict=True)
+                ]
+            )
+        return centroid
+
+    def _prf_terms(
+        self,
+        connection: sqlite3.Connection,
+        window_ids: Sequence[int],
+        epoch: int,
+        query: str,
+        column: str,
+        config: PrfLexicalConfig,
+    ) -> list[str]:
+        """Mine expansion terms from the BM25 leaders (TF-IDF-ish, stopword-free).
+
+        DF is measured inside the seed set rather than over the whole scope: a
+        global count would need a per-scope vocabulary table and the seed set is
+        what actually defines the topic. Terms already in the query and terms
+        that appear in most seeds are dropped, so the expansion adds vocabulary
+        without repeating the query or latching onto a boilerplate phrase.
+        """
+        if not window_ids:
+            return []
+        placeholders = ",".join("?" for _ in window_ids)
+        rows = connection.execute(
+            f"SELECT window_id, {column} AS tokens FROM windows "
+            f"WHERE window_id IN ({placeholders}) AND published_epoch<=?",
+            (*window_ids, epoch),
+        ).fetchall()
+        documents: list[list[str]] = []
+        for row in rows:
+            text = str(row["tokens"] or "")
+            if column == "lexical_zh":
+                tokens = [token for token in text.split() if token]
+            else:
+                tokens = [token for token in _PRF_TOKEN_RE.findall(text.lower()) if token]
+            if tokens:
+                documents.append(tokens)
+        if not documents:
+            return []
+        query_terms = set(english_terms(query)) | set(chinese_terms(query))
+        tf: dict[str, int] = defaultdict(int)
+        df: dict[str, int] = defaultdict(int)
+        for tokens in documents:
+            for token in tokens:
+                tf[token] += 1
+            for token in set(tokens):
+                df[token] += 1
+        min_length = config.min_term_length
+        max_ratio = config.max_seed_df_ratio
+        max_df = max(1, int(len(documents) * max_ratio))
+        scored: list[tuple[float, str]] = []
+        for term, count in tf.items():
+            if len(term) < min_length or term in query_terms or term in _STOP:
+                continue
+            if df[term] > max_df:
+                continue
+            if term.isdigit() and len(term) < 3:
+                continue
+            score = count * math.log(1.0 + len(documents) / max(1, df[term]))
+            scored.append((score, term))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [term for _, term in scored[: config.max_terms]]
+
+    @staticmethod
+    def _fts_expression_hits(
+        connection: sqlite3.Connection,
+        table: str,
+        expression: str | None,
+        epoch: int,
+        limit: int,
+    ) -> list[int]:
+        if not expression or limit <= 0:
+            return []
+        rows = connection.execute(
+            f"""SELECT f.rowid AS window_id, bm25({table}) AS rank_score
+                FROM {table} AS f
+                JOIN active_windows AS a ON a.window_id=f.rowid
+                WHERE {table} MATCH ? AND a.published_epoch<=?
+                ORDER BY rank_score ASC, f.rowid ASC LIMIT ?""",
+            (expression, epoch, limit),
+        ).fetchall()
+        return [int(row["window_id"]) for row in rows]
 
     @staticmethod
     def _dense_hits(
@@ -1005,6 +1292,73 @@ class SearchService:
             channels=set().union(*(candidate.channels for candidate in candidates)),
         )
 
+    def _attach_message_neighbors(
+        self, connection: sqlite3.Connection, rows: Mapping[int, dict[str, object]]
+    ) -> None:
+        """Attach the verbatim adjacent turns when a window touches a message boundary.
+
+        A script line (and a chat turn) is its own message: a hit like "He stops...
+        He is embarrassed" loses its subject unless the previous line is shown. This
+        is the cross-message counterpart of `neighbor_expand_chars` (which only
+        widens inside one message). Long neighbours (documents) are skipped so a
+        book chunk never drags another document into the response.
+        """
+        limit = int(self._pipeline.retrieval.neighbor_message_chars or 0)
+        if limit <= 0 or not rows:
+            return
+        wanted: set[int] = set()
+        for row in rows.values():
+            spans = row.get("source_spans") or []
+            if not spans:
+                continue
+            wanted.add(int(spans[0]["message_id"]))
+            wanted.add(int(spans[-1]["message_id"]))
+        wanted.update(mid - 1 for mid in list(wanted))
+        wanted.update(mid + 1 for mid in list(wanted))
+        marks = ",".join("?" for _ in wanted)
+        fetched = {
+            int(source["message_id"]): (str(source["request_id"]), str(source["raw_content"]))
+            for source in connection.execute(
+                f"SELECT message_id, request_id, raw_content FROM messages "
+                f"WHERE message_id IN ({marks})",
+                tuple(wanted),
+            )
+        }
+        for row in rows.values():
+            spans = row.get("source_spans") or []
+            if not spans:
+                continue
+            first, last = spans[0], spans[-1]
+            request = str(first["request_id"])
+            previous = fetched.get(int(first["message_id"]) - 1)
+            if (
+                previous is not None
+                and previous[0] == request
+                and int(first["start_char"]) == 0
+                and len(previous[1]) <= limit * 4
+            ):
+                row["neighbor_prev"] = _snap_prefix(previous[1][-limit:])
+            following = fetched.get(int(last["message_id"]) + 1)
+            if (
+                following is not None
+                and following[0] == request
+                and int(last["end_char"]) == len(str(last["raw_content"]))
+                and len(following[1]) <= limit * 4
+            ):
+                row["neighbor_next"] = _snap_suffix(following[1][:limit])
+
+    @staticmethod
+    def _expand_neighbor_messages(row: Mapping[str, object], content: str) -> str:
+        parts: list[str] = []
+        previous = row.get("neighbor_prev")
+        following = row.get("neighbor_next")
+        if isinstance(previous, str) and previous:
+            parts.append(previous)
+        parts.append(content)
+        if isinstance(following, str) and following:
+            parts.append(following)
+        return "\n\n".join(parts)
+
     def _prepare_rerank_entries(
         self,
         fused: Sequence[FusedCandidate],
@@ -1039,8 +1393,13 @@ class SearchService:
             candidate = group.candidate
             rerank_content, view_id, spans = render_window(group.row)
             response_content, _, _ = render_response_window(group.row)
+            response_content = self._expand_neighbor_messages(group.row, response_content)
             source_spans = group.row["source_spans"]
             primary_span = source_spans[0]  # type: ignore[index]
+            if self._pipeline.groups.prepend_document_title:
+                title = _document_title(str(primary_span.get("raw_content") or ""))
+                if title and title not in response_content:
+                    response_content = f"{title}\n\n{response_content}"
             created_at_ms = _resolved_created_at_ms(
                 primary_span.get("source_timestamp_ms"),
                 primary_span.get("request_received_ms"),
@@ -1302,6 +1661,38 @@ class SearchService:
             )
         return [float(score) for score in result if score is not None]
 
+    def _apply_feedback_policy(
+        self,
+        ranked: Sequence[tuple[RerankEntry, float]],
+        query: str,
+        diagnostics: dict[str, object],
+    ) -> list[tuple[RerankEntry, float]]:
+        """Keep this question's own feedback in place, move other questions' to the tail.
+
+        The platform injects `Streaming online QA feedback` messages as ordinary
+        user messages. They all share the same boilerplate, so dense retrieval ranks
+        them ahead of the source text (measured on the 2026-10-15 full-run scopes:
+        82% of the top-10 and 67% of the top-30 at steps 3-5). Feedback for *this*
+        question is the online-learning signal and must stay where it is; feedback
+        for other questions is template noise and must not displace the evidence the
+        answer model needs. The reorder is stable and drops nothing here.
+        """
+        if getattr(self._pipeline.groups, "feedback_policy", "off") != "demote_other":
+            return list(ranked)
+        target = _normalised_question(query)
+        keep: list[tuple[RerankEntry, float]] = []
+        demote: list[tuple[RerankEntry, float]] = []
+        for entry, score in ranked:
+            question = _feedback_question(entry.response_content)
+            if question is not None and _normalised_question(question) != target:
+                demote.append((entry, score))
+            else:
+                keep.append((entry, score))
+        if demote:
+            diagnostics["feedback_demoted"] = len(demote)
+            diagnostics["feedback_kept"] = len(keep)
+        return keep + demote
+
     def _select_output(
         self,
         ranked: Sequence[tuple[RerankEntry, float]],
@@ -1353,6 +1744,13 @@ class SearchService:
             # text such as "Session 1 (1:56 pm on 8 May, 2023)" — never a
             # "Time: " prefix, which the platform strips from the response text.
             content = attach_anchor(entry.response_content, entry.anchor)
+            whole_message = None
+            full_records = int(self._pipeline.groups.full_message_records or 0)
+            full_chars = int(self._pipeline.groups.full_message_chars or 0)
+            if len(selected) < full_records and full_chars > 0 and entry.spans:
+                raw = entry.spans[0].get("raw_content")
+                if isinstance(raw, str) and len(raw) > len(content):
+                    whole_message = attach_anchor(raw[:full_chars], entry.anchor)
             anchor_scope = self._pipeline.groups.time_anchor_scope
             if self._pipeline.groups.time_anchor_in_text and (
                 anchor_scope == "all" or is_temporal_query(query)
@@ -1381,6 +1779,8 @@ class SearchService:
                         widened.append(raw[left:right])
                 if widened:
                     content = attach_anchor(_RESPONSE_SPAN_SEPARATOR.join(widened), entry.anchor)
+            if whole_message is not None:
+                content = whole_message
             head_records = int(getattr(self._pipeline.groups, "head_records", 0) or 0)
             tail_cut = int(getattr(self._pipeline.groups, "tail_cut_chars", 0) or 0)
             if (

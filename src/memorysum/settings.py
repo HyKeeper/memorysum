@@ -60,6 +60,69 @@ class RerankerConfig(FrozenConfig):
     wide_candidate_groups: int
     batch_groups: int
     max_concurrency: int
+    #: Feed the option texts to the cross-encoder alongside the question. On
+    #: multiple-choice scopes the six rewritten option sentences dilute the
+    #: question signal; `false` reranks on the question alone (options still drive
+    #: the `options_lexical` channel and the response).
+    include_options: bool = True
+
+
+class PrfDenseConfig(FrozenConfig):
+    """Second dense recall from the first-round document centroid.
+
+    The first-round documents (vector + lexical leaders) are averaged into one
+    centroid vector and used as a *second* query, the PRF recipe. Only its
+    increments (windows the main channels did not return) enter the fusion, at a
+    low weight, so a bad centroid can add noise but cannot displace the main
+    ranking. See docs/todo-prf-query-expansion.md.
+    """
+
+    enabled: bool = True
+    #: How many leaders from each of the two main routes feed the centroid.
+    seed_docs: int = 16
+    #: Windows kept after the second recall (before the increment filter).
+    neighbors: int = 64
+    #: RRF channel weight for the increments (main channels run at 1-2).
+    weight: float = 0.6
+    #: 0 = pure document centroid; 0.5 = half original query, half centroid.
+    query_mix: float = 0.0
+    #: Do not build a centroid from fewer documents than this.
+    min_seeds: int = 4
+
+
+class PrfLexicalConfig(FrozenConfig):
+    """Second BM25 recall from terms mined out of the first-round documents."""
+
+    enabled: bool = True
+    #: How many BM25 leaders are mined for expansion terms.
+    seed_docs: int = 8
+    #: How many expansion terms enter the second query.
+    max_terms: int = 8
+    #: Windows kept after the second recall (before the increment filter).
+    neighbors: int = 32
+    weight: float = 0.3
+    #: Drop short terms; they are mostly function words and tokenizer debris.
+    min_term_length: int = 4
+    #: Drop terms present in more than this fraction of seed documents.
+    max_seed_df_ratio: float = 0.6
+
+
+class PrfConfig(FrozenConfig):
+    """Four-way recall: two main routes + two low-weight expansion routes.
+
+    Expansion routes only contribute increments (never a main-route window) and
+    are fused with a lower weight; the final ordering still comes from the
+    original query (rerank + fusion). Disabled by default until an A/B shows it
+    helps on the offline harness.
+    """
+
+    enabled: bool = False
+    #: Short-list queries do not need a wider net; the article's own guard.
+    min_top_k: int = 30
+    dense: PrfDenseConfig = PrfDenseConfig()
+    lexical: PrfLexicalConfig = PrfLexicalConfig()
+    #: Also mine `lexical_zh` terms for the Chinese FTS index (jieba tokens).
+    lexical_zh: bool = True
 
 
 class RetrievalModeConfig(FrozenConfig):
@@ -115,6 +178,13 @@ class RetrievalConfig(FrozenConfig):
     #: text often holds the second half of a multi-hop answer, which leaf windows cut
     #: away; 0 keeps the response byte-identical to the indexed window.
     neighbor_expand_chars: int = 0
+    #: Prepend/append the adjacent *messages* (verbatim, up to this many characters
+    #: each) when a returned window starts/ends at a message boundary. Scripts and
+    #: chat turns are one message per line, so a hit like "He stops... He is
+    #: embarrassed" loses the speaker without the previous turn. 0 disables it.
+    neighbor_message_chars: int = 0
+    #: Pseudo-relevance-feedback expansion (see PrfConfig). Off by default.
+    prf: PrfConfig = PrfConfig()
     ordinary: RetrievalModeConfig
     wide: RetrievalModeConfig
 
@@ -158,6 +228,25 @@ class GroupConfig(FrozenConfig):
     #: 真实元数据（不是编造内容），成本约每记录 10 proxy token。
     time_anchor_scope: Literal["temporal", "all"] = "temporal"
     time_anchor_template: str = "Session {session} ({date})"
+    #: How to treat the platform's injected QA-feedback messages. Their boilerplate
+    #: makes them dominate dense retrieval on streaming scopes (measured: 82% of the
+    #: top-10 at steps 3-5), which pushes the actual source evidence out of the answer
+    #: model's view. `demote_other` moves feedback about *other* questions behind all
+    #: source evidence while leaving this question's own feedback in place (it is the
+    #: online-learning signal). `off` keeps the historical behaviour.
+    feedback_policy: Literal["off", "demote_other"] = "off"
+    #: Prepend the source message's own `Document title: ...` line to a returned
+    #: window that lost it (document corpora are split into several windows; the
+    #: title only sits in the first one). The line is copied verbatim from the same
+    #: source message -- no synthesis -- and is a no-op when the window already has
+    #: it or the message is not a titled document.
+    prepend_document_title: bool = False
+    #: Return the first N records as their *whole source message* (verbatim, capped at
+    #: `full_message_chars`) instead of the ranked window slice. A ranked slice can
+    #: cut the fact or the table row that made the message relevant; the whole message
+    #: is still original text (no synthesis). 0 disables it.
+    full_message_records: int = 0
+    full_message_chars: int = 3000
 
 
 class CoverageConfig(FrozenConfig):

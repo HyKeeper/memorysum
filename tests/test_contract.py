@@ -154,3 +154,26 @@ def test_time_anchor_scope_stays_declared_and_typed():
     assert groups.time_anchor_scope in {"temporal", "all"}
     with pytest.raises(ValidationError):
         GroupConfig(**{**groups.model_dump(), "time_anchor_scope": "everything"})
+
+
+def test_feedback_policy_is_declared_and_typed():
+    """QA-feedback 的排序策略是 streaming.online 叶子的实验开关，必须显式且可校验。
+
+    平台在 streaming 轮里把上一题的 QA feedback 当普通 user 消息写进来，它们的
+    boilerplate 会让 dense 检索把它们排到正文前面（实测 steps 3-5 的 top-10 有 82%
+    是 feedback）。`demote_other` 只把「别的题」的 feedback 移到正文之后，本题的
+    feedback 留在原位（在线学习信号）。若这个键被删掉，行为会静默回到 `off`。
+    """
+    import json
+    from importlib.resources import files
+
+    from memorysum.settings import GroupConfig, load_pipeline_config
+
+    payload = json.loads(
+        files("memorysum").joinpath("config/champion-v1.json").read_text(encoding="utf-8")
+    )
+    assert "feedback_policy" in payload["groups"], "feedback 策略必须在 config 里显式声明"
+    groups = load_pipeline_config().groups
+    assert groups.feedback_policy in {"off", "demote_other"}
+    with pytest.raises(ValidationError):
+        GroupConfig(**{**groups.model_dump(), "feedback_policy": "everything"})

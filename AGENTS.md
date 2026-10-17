@@ -26,6 +26,14 @@
 - qinstr2（新 query instruction）→ 已回退到旧指令
 - chunk512（大窗口）→ 已回退到 leaf 256 / context 320
 
+**2026-10-17 起的检索/内容参数**（config `20696a50d0b6…`；full 52.27 之后，尚未经平台验证）：
+- `reranker.fusion_weight` 2.0 → **3.0**；`retrieval.neighbor_expand_chars` 0 → **600**；
+- `groups.prepend_document_title=true`（窗口丢了同一消息的 `Document title:` 时逐字补回）；
+- `groups.feedback_policy=demote_other`（别的题的 QA feedback 移到正文后，**本题 feedback 原位**；
+  streaming top-10 feedback 占比 82%→31%，本地代理无 feedback 故测不到收益）；
+- `retrieval.prf.enabled=false`（四路 PRF 已实现并实测：200 题代理 53.0%，中性，未上车）。
+- 本地代理 53.5%→**56.5%**；平台 full 未重跑（30 天锁）。详见 `docs/session-2026-10-17.md`。
+
 ## 环境与运行
 
 - Python 3.12（`>=3.12,<3.13`），虚拟环境在 `.venv/`
@@ -75,6 +83,12 @@
 **qinstr2（新 query instruction）上线后未重测**：库向量不变（document 侧无指令）但 query 向量已变，
 数字会漂；且实测旧 scope 未被 503 拦截（第 51 条），行为待查。历史参考：bge 时代同口径
 txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见第 32、33 条）。
+
+**另一把尺（2026-10-17）：`exp/selfeval-hard`** —— 200 道 full 轮真题（books 84 / scriptMem 92 /
+as-of 24），判据「金答案证据是否进返回前 10」（K=10，R=0.5）；基线 **53.5%**，与平台 full 52.27
+差 1.2 分。排序/渲染改动优先用它，但要注意：① 它的 streaming/scriptMem 占比（46%）高于 full（26%）；
+② 它**没有** QA feedback，所以 `feedback_policy` 在它上面是 no-op；③ 单题 McNemar 需要 +8/−3
+才勉强到 p≈0.23，200 题只能检测 >5% 的效应。
 
 ## 踩过的坑（都已实测，别重复尝试）
 
