@@ -219,13 +219,14 @@ def test_provider_factory_splits_local_embeddings_from_remote_rerank():
         return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.7}]})
 
     pipeline = load_pipeline_config()
-    # Pin the remote reranker explicitly so this test does not depend on the
-    # packaged config's current choice.
+    # Pin both providers explicitly so this test does not depend on the packaged
+    # config's current choice (embedding is now DashScope by default).
     pipeline = pipeline.model_copy(
         update={
+            "embedding": pipeline.embedding.model_copy(update={"provider": "local-openai"}),
             "reranker": pipeline.reranker.model_copy(
                 update={"provider": "openrouter", "enabled": True}
-            )
+            ),
         }
     )
     provider = build_provider(
@@ -261,9 +262,10 @@ def test_provider_factory_serves_local_rerank_endpoint_with_plain_list_response(
     pipeline = load_pipeline_config()
     pipeline = pipeline.model_copy(
         update={
+            "embedding": pipeline.embedding.model_copy(update={"provider": "local-openai"}),
             "reranker": pipeline.reranker.model_copy(
                 update={"provider": "local-openai", "enabled": True}
-            )
+            ),
         }
     )
     provider = build_provider(
@@ -292,7 +294,7 @@ def test_local_rerank_oversized_input_fails_fast_instead_of_retrying(monkeypatch
     deadline (measured: every failed Search stalled 3027 ms before returning 503).
     """
     monkeypatch.setattr(
-        "memorysum.providers.local_openai.time.sleep",
+        "memorysum.providers.http_post.time.sleep",
         lambda _seconds: pytest.fail("an oversized input must not be retried"),
     )
     calls: list[httpx.Request] = []
@@ -327,7 +329,7 @@ def test_local_rerank_oversized_input_fails_fast_instead_of_retrying(monkeypatch
 
 def test_local_rerank_transient_server_error_is_still_retried(monkeypatch):
     """A 5xx without a capacity message stays retryable (slots may be busy)."""
-    monkeypatch.setattr("memorysum.providers.local_openai.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("memorysum.providers.http_post.time.sleep", lambda _seconds: None)
     calls: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -350,8 +352,13 @@ def test_local_rerank_transient_server_error_is_still_retried(monkeypatch):
 def test_embedding_endpoint_follows_the_configured_provider():
     pipeline = load_pipeline_config()
     runtime = _local_runtime()
-    assert pipeline.embedding.provider == "local-openai"
-    assert embedding_endpoint(runtime, pipeline) == "http://127.0.0.1:7999/v1"
+    assert pipeline.embedding.provider == "dashscope"
+    assert embedding_endpoint(runtime, pipeline) == "https://dashscope.aliyuncs.com"
+
+    local_pipeline = pipeline.model_copy(
+        update={"embedding": pipeline.embedding.model_copy(update={"provider": "local-openai"})}
+    )
+    assert embedding_endpoint(runtime, local_pipeline) == "http://127.0.0.1:7999/v1"
 
     remote_pipeline = pipeline.model_copy(
         update={"embedding": pipeline.embedding.model_copy(update={"provider": "openrouter"})}

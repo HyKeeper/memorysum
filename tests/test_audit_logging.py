@@ -22,6 +22,14 @@ class FakeProvider:
         pass
 
 
+def make_pipeline():
+    """FakeProvider returns 3-d vectors; declare that dimension for the Add guard."""
+    pipeline = load_pipeline_config()
+    return pipeline.model_copy(
+        update={"embedding": pipeline.embedding.model_copy(update={"dimension": 3})}
+    )
+
+
 def make_runtime(data_root: Path, *, debug: bool):
     return RuntimeSettings(
         data_root=data_root,
@@ -40,7 +48,7 @@ def test_debug_logs_include_payload_but_never_credentials_or_headers(tmp_path, c
     runtime = make_runtime(tmp_path / "data", debug=True)
     app = create_app(
         runtime=runtime,
-        pipeline=load_pipeline_config(),
+        pipeline=make_pipeline(),
         provider=FakeProvider(),
         start_cleanup=False,
     )
@@ -91,7 +99,7 @@ def test_normal_mode_does_not_log_payload_or_audit_summaries(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger="uvicorn.error")
     app = create_app(
         runtime=make_runtime(tmp_path / "data", debug=False),
-        pipeline=load_pipeline_config(),
+        pipeline=make_pipeline(),
         provider=FakeProvider(),
         start_cleanup=False,
     )
@@ -115,7 +123,7 @@ def test_normal_mode_does_not_log_payload_or_audit_summaries(tmp_path, caplog):
 
 
 def test_debug_payload_logging_is_not_gated_by_pipeline_status(tmp_path):
-    pipeline = load_pipeline_config().model_copy(update={"qualification_status": "ready"})
+    pipeline = make_pipeline().model_copy(update={"qualification_status": "ready"})
     app = create_app(
         runtime=make_runtime(tmp_path / "data", debug=True),
         pipeline=pipeline,

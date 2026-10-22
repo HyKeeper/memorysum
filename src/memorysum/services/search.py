@@ -47,6 +47,7 @@ from memorysum.core.text import (
     chinese_terms,
     clip_middle,
     collapse_whitespace,
+    compose_embedding_input,
     english_terms,
     query_options_text,
     reader_token_count,
@@ -591,7 +592,7 @@ class SearchService:
         cached = self._query_vectors.get(key)
         if cached is not None:
             return cached
-        query_input = self._pipeline.embedding.query_instruction + "\n\n" + query
+        query_input = compose_embedding_input(self._pipeline.embedding.query_instruction, query)
         vectors = self._provider.embed([query_input])
         normalized, _ = normalize_batch(vectors, 1)
         vector = normalized[0]

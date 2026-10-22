@@ -152,6 +152,19 @@ def query_options_text(query: str, options: list[str] | None) -> str:
     return query + "\n\nOptions:\n" + "\n".join(options)
 
 
+def compose_embedding_input(instruction: str | None, text: str) -> str:
+    """Join an optional retrieval instruction with the text that gets embedded.
+
+    Providers that need no instruction (e.g. DashScope ``text-embedding-v4``) leave
+    ``query_instruction`` empty; in that case the text must be embedded verbatim instead
+    of gaining a leading ``"\n\n"`` from a blind join.
+    """
+    prefix = (instruction or "").strip()
+    if not prefix:
+        return text
+    return f"{prefix}\n\n{text}"
+
+
 def utc_timestamp(timestamp_ms: int | None) -> str:
     if timestamp_ms is None:
         return "unknown"

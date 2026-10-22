@@ -1,11 +1,11 @@
 {
-  "pipeline_id": "memorysum-hybrid-preview-v0.5.0",
+  "pipeline_id": "memorysum-hybrid-dashscope-v0.6.0",
   "qualification_status": "provisional",
   "embedding": {
-    "provider": "local-openai",
-    "model": "qwen3-embedding-4b",
-    "dimension": "auto-detect-on-first-successful-embedding",
-    "query_instruction": "Instruct: Given a search query, retrieve relevant memories that answer the query\nQuery:",
+    "provider": "dashscope",
+    "model": "text-embedding-v4",
+    "dimension": 2048,
+    "query_instruction": "",
     "document_instruction": null,
     "batch_items": 10,
     "batch_proxy_tokens": 8192,

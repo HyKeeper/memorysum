@@ -29,10 +29,17 @@ class ChunkingConfig(FrozenConfig):
     context: ChunkScaleConfig
 
 
+#: `auto-detect-on-first-successful-embedding` is only valid for providers whose
+#: response dimension is stable and verified against the stored scope manifest. Hosted
+#: providers such as DashScope must state the dimension explicitly: their documented
+#: default (1024) is not the dimension the scope was built for.
+DimensionSetting = int | Literal["auto-detect-on-first-successful-embedding"]
+
+
 class EmbeddingConfig(FrozenConfig):
     provider: str
     model: str
-    dimension: str
+    dimension: DimensionSetting
     query_instruction: str
     document_instruction: str | None
     batch_items: int
@@ -208,7 +215,7 @@ class PipelineConfig(FrozenConfig):
                 self.embedding.model,
                 self.embedding.query_instruction,
                 self.embedding.document_instruction or "",
-                "dimension:auto",
+                f"dimension:{self.embedding.dimension}",
             )
         )
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
@@ -236,6 +243,11 @@ class RuntimeSettings:
     embedding_api_key: SecretStr | None = None
     rerank_base_url: str = "http://127.0.0.1:7997"
     rerank_api_key: SecretStr | None = None
+    #: DashScope native API host (provider "dashscope"). Point this at the dedicated
+    #: MaaS deployment when the account uses one; the public endpoint was observed
+    #: ignoring the requested dimension (see providers/dashscope.py).
+    dashscope_base_url: str = "https://dashscope.aliyuncs.com"
+    dashscope_api_key: SecretStr | None = None
 
     @classmethod
     def from_environment(cls) -> RuntimeSettings:
@@ -273,6 +285,11 @@ class RuntimeSettings:
         api_key = os.getenv("OPENROUTER_API_KEY")
         embedding_api_key = os.getenv("MEMORYSUM_EMBEDDING_API_KEY")
         rerank_api_key = os.getenv("MEMORYSUM_RERANK_API_KEY")
+        # DashScope's own CLI convention is DASHSCOPE_API_KEY; the namespaced variable
+        # wins so one process can keep separate credentials for separate services.
+        dashscope_api_key = os.getenv("MEMORYSUM_DASHSCOPE_API_KEY") or os.getenv(
+            "DASHSCOPE_API_KEY"
+        )
         return cls(
             data_root=Path(os.getenv("MEMORYSUM_DATA_ROOT", "./data")).expanduser().resolve(),
             openrouter_base_url=os.getenv(
@@ -292,6 +309,10 @@ class RuntimeSettings:
                 "/"
             ),
             rerank_api_key=SecretStr(rerank_api_key) if rerank_api_key else None,
+            dashscope_base_url=os.getenv(
+                "MEMORYSUM_DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com"
+            ).rstrip("/"),
+            dashscope_api_key=SecretStr(dashscope_api_key) if dashscope_api_key else None,
         )
 
 

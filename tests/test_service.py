@@ -65,6 +65,7 @@ def make_app(
     *,
     rerank_enabled: bool = True,
     reranker_overrides: dict | None = None,
+    embedding_overrides: dict | None = None,
     groups_overrides: dict | None = None,
 ):
     runtime = RuntimeSettings(
@@ -77,6 +78,12 @@ def make_app(
         port=8001,
     )
     pipeline = load_pipeline_config()
+    # FakeProvider emits 3-d vectors; declare that dimension so the Add guard (which
+    # refuses vectors that do not match embedding.dimension) stays honest in tests.
+    embedding_update: dict = {"dimension": 3, **(embedding_overrides or {})}
+    pipeline = pipeline.model_copy(
+        update={"embedding": pipeline.embedding.model_copy(update=embedding_update)}
+    )
     if pipeline.reranker.enabled != rerank_enabled or reranker_overrides:
         pipeline = pipeline.model_copy(
             update={
@@ -98,6 +105,27 @@ def make_app(
         provider=provider,
         start_cleanup=False,
     )
+
+
+def test_add_rejects_vectors_that_do_not_match_the_declared_dimension(tmp_path):
+    """A provider must never silently create a vec0 table for another dimension."""
+    app = make_app(
+        tmp_path / "data",
+        FakeProvider(),
+        embedding_overrides={"dimension": 4},
+    )
+    payload = {
+        "request_id": "dimension-mismatch",
+        "user_id": "dimension-user",
+        "session_id": "session-1",
+        "messages": [{"role": "user", "content": "I prefer tea in the morning."}],
+    }
+    with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+        response = client.post("/add", json=payload)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "model_provider_invalid_embedding"
+    assert "4" in response.json()["detail"]["message"]
 
 
 def test_add_is_synchronous_idempotent_and_user_isolated(tmp_path):

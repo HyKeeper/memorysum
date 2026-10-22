@@ -4,16 +4,20 @@
 
 ## 项目是什么
 
-原文保真的记忆服务：`Add` 写入、`Search` 检索。FastAPI + SQLite（FTS5 + sqlite-vec），模型侧依赖本机 llama.cpp 提供 embedding 与 cross-encoder rerank。**不生成答案，只返回可回溯到原文的证据片段。**
+原文保真的记忆服务：`Add` 写入、`Search` 检索。FastAPI + SQLite（FTS5 + sqlite-vec）。embedding 默认走 DashScope `text-embedding-v4`（原生 text-embedding API，2048 维），reranker 默认由本机 llama.cpp 提供 cross-encoder 精排。**不生成答案，只返回可回溯到原文的证据片段。**
 
-## 当前部署状态（2026-10-15 起）
+## 当前部署状态（2026-10-20 起）
 
-**两个常驻进程**：
+**两个常驻进程 + 一个远程模型**：
 - memorysum `:8001`（FastAPI 服务）
-- embedding `:7999`（`Qwen3-Embedding-4B-Q8_0`，F16 KV cache，官方 llama.cpp，**`--cache-ram 0`**）
 - reranker `:7997`（`bge-reranker-v2-m3-F16`，官方 llama.cpp，`--reranking --pooling rank`，**`--cache-ram 0`**）
+- embedding：阿里云 DashScope `text-embedding-v4`（原生 text-embedding API，**2048 维**，
+  `embedding.provider = "dashscope"`），通过 HTTPS 调用专用 MaaS 端点
+  `https://llm-5qr9sf5t4nflguf4.cn-beijing.maas.aliyuncs.com`；密钥用 `DASHSCOPE_API_KEY`
+  （或 `MEMORYSUM_DASHSCOPE_API_KEY`），端点用 `MEMORYSUM_DASHSCOPE_BASE_URL` 覆盖。
+- 本机 `:7999` 的 `Qwen3-Embedding-4B-Q8_0` 只作为回退路径保留（`provider = "local-openai"`）。
 
-> **两个模型服务必须带 `--cache-ram 0` 启动**（2026-10-16）。llama.cpp 的 prompt cache 对
+> **本机模型服务（reranker；以及回退时的本地 embedding）必须带 `--cache-ram 0` 启动**（2026-10-16）。llama.cpp 的 prompt cache 对
 > BERT/embedding 这类非 causal pooling 模型**永不淘汰**（state 大小恒为 0 → 容量上限失效；
 > `size_per_token` 被 `max(1.0, 0/n_tokens)` 钉在 1.0 → token 上限被放大成 8.6e9），
 > 每处理一条输入就永久留存一条，且每个任务都要全表扫一遍。实测：rerank 连续跑 24h、
@@ -23,7 +27,8 @@
 
 **已回退的改动**（历史记录，不在当前版本）：
 - jina-reranker-v3.5（fork llama.cpp + projector MLP + rerank_server.py）→ 已回退到 bge
-- qinstr2（新 query instruction）→ 已回退到旧指令
+- qinstr2（新 query instruction）→ 已回退；当前 `text-embedding-v4` 用空指令
+  （`embedding.query_instruction = ""`，代码对空指令不再拼 `"\n\n"`）
 - chunk512（大窗口）→ 已回退到 leaf 256 / context 320
 
 ## 环境与运行
@@ -43,7 +48,7 @@
 1. **原文保真**：只存原始消息，窗口存 Unicode 半开区间；API 返回的正文必须是原文切片（可以加 `Source role:`/`Passage:` 渲染前缀，但不能改写正文）。
 2. **参数可审计**：算法参数只在 `src/memorysum/config/champion-v1.json`；环境变量只放密钥、服务地址、数据目录、入站鉴权。**新增配置项必须让代码真的读它**（见"踩过的坑"第 4 条）。
 3. **不静默降级**：模型失败必须返回非 2xx，绝不退化成"纯词法检索还报成功"。
-4. **改数据契约要 bump `pipeline_id`**：embedding provider/model/instruction/dimension、chunk/window renderer、索引格式变化 → 新建版本，否则旧 scope 一律 503 `pipeline_mismatch`（不会自动退休重建）。**只改排序参数**（通道权重、融合权重、reranker 开关）**不必 bump**，已有数据可复用。
+4. **改数据契约要 bump `pipeline_id`**：embedding provider/model/instruction/dimension、**embedding 端点地址**（`api/app.py` 会把 endpoint 并入 DB 指纹）、chunk/window renderer、索引格式变化 → 新建版本，否则旧 scope 一律 503 `pipeline_mismatch`（不会自动退休重建）。**只改排序参数**（通道权重、融合权重、reranker 开关）**不必 bump**，已有数据可复用。
 5. **信息源只有被动观测，不要等人回答**：评测方**只**发起 `/add`、`/search` 并给出分数，
    **不对任何提问作回应**（包括我们写在文档里的"待核对"项）。所以：
    - 仓库里**禁止出现"专家说／平台确认／项目方确认 X"式的陈述** —— 它不可验证，而且会被后来的 agent 当成事实引用（第 37 条就是一次连累上线配置的实例）。要写平台侧行为，只能写两种：**"我们从流量里观测到 X"**（附可复现的取数方式）或 **"我们推测 X（未验证）"**；
@@ -68,6 +73,11 @@
 ```
 
 **必须同时看 split-half，不能只看全样本净值。** 实测教训：纯 rerank 排序的全样本成绩是"净 +1"，看着像小胜；拆成两半却是 **+4 / −3**——两半相抵的假象掩盖了它其实不可靠。凡是"用新信号取代旧信号"的改动，都要用两半各自成立来证明。
+
+> **注意（2026-10-20）**：embedding 已从本机 Qwen3-Embedding 换成 DashScope
+> `text-embedding-v4`（2048 维），`pipeline_id` / `embedding_space_id` 都变了。
+> 下面的 BEAM 基准是在**旧 embedding 空间**上测的，**不能与新配置直接对比**；
+> 换模型后必须重新灌数据并重跑 `eval_retrieval.py` 才能得到新基线。
 
 当前基准（2026-10-15，**jina-reranker-v3.5 + 旧 query instruction**）：
 **txt_all top-1 49/60、top-3 56/60、MRR 0.8822；ids_all top-1 39/60（历史最好，bge 时代 37）、top-3 50/60、MRR 0.7459**
@@ -220,6 +230,25 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
     **实测**（真实 query）：35,522 字符 → 422/68.4s 变 200/0.96s；42k 字符在大 scope 上 6.6s/100 条；
     小 scope 的文档题 0.14~0.28s。诊断：`rerank_query_clipped` / `retrieval_query_clipped` /
     `unreranked_candidates`；真一个对都塞不进时仍走 `hybrid_retrieval_unreranked` + WARNING。
+
+52. **DashScope `text-embedding-v4` 的实测边界（2026-10-20，别重复踩）**：
+    - **原生接口，不是 OpenAI 兼容模式**：`POST {base}/api/v1/services/embeddings/text-embedding/text-embedding`，
+      body 是 `{"model":"text-embedding-v4","input":{"texts":[...]},"dimension":2048}`，
+      响应是 `{"output":{"embeddings":[{"text_index":i,"embedding":[...]}]},"usage":{"total_tokens":n}}`。
+      我们的 `providers/dashscope.py` 只实现这一条路径；`local-openai` 的 `/v1/embeddings` 解析器不能复用。
+    - **单请求最多 10 条**：11 条直接 HTTP 400 `InvalidParameter: batch size is invalid, it should not be larger than 10`。
+      `embedding.batch_items` 必须 ≤10（provider 初始化时校验）。
+    - **维度必须显式**：`dimension` 可选 64/128/256/512/768/1024/1536/2048/3072，默认 1024。
+      **公共端点 `https://dashscope.aliyuncs.com` 实测会忽略 `dimension: 2048` 并返回 1024 维**
+      （同一个 key 在专用 MaaS 端点 `https://llm-5qr9sf5t4nflguf4.cn-beijing.maas.aliyuncs.com` 上正确返回 2048）。
+      因此 provider 逐条校验响应维度，不一致抛 503 `model_provider_invalid_embedding`，
+      **绝不**把 1024 维向量写进按 2048 维建表的 scope（AddService 里也有一道同样的检查）。
+      注意：`api/app.py` 把 embedding 端点地址也并入了数据库指纹，**换 base URL 同样会让旧 scope 503**。
+    - **不需要 instruction**：v4 没有 `instruction` 参数；`instruct` 仅在 `text_type=query` 时生效，
+      我们没设 `text_type`（默认 `document`），所以配置用空 `query_instruction`。若将来要做
+      query/document 非对称编码，需要同时改 `ModelProvider.embed` 协议（增加角色参数）并 bump
+      `embedding_space_id`，不要只在一侧偷偷加前缀。
+    - 单条文本 8000/9000 个中文字符实测可用（服务端标注上限 8192 token）；本管线窗口 256/320 字符，远低于上限。
 
 ## 本机环境的坑
 

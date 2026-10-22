@@ -13,157 +13,23 @@ response shapes seen in the wild:
 
 from __future__ import annotations
 
-import contextlib
-import json
 import logging
 import math
 import threading
-import time
 from collections.abc import Sequence
 from typing import Any
 
 import httpx
 
 from memorysum.core.errors import ProviderError
+from memorysum.providers.http_post import post_json
 from memorysum.providers.openrouter import OpenRouterProvider
 from memorysum.providers.protocols import RerankScore
 from memorysum.settings import PipelineConfig, RuntimeSettings
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 _CONCURRENCY = 8
-
-#: llama.cpp rejects a prompt that does not fit in one physical batch, or in the slot
-#: context, with HTTP 500. The prompt is simply too long for the model - retrying cannot
-#: help, and waiting 1 s + 2 s for the same rejection burns the caller's deadline (measured
-#: on 2026-10-14: every failed Search stalled for 3027 ms and then returned 503).
-#: The pipeline's own budget (`reranker.single_pair_proxy_tokens`) is a *proxy* estimate and
-#: deliberately conservative; `reranker -ub` must cover its worst-case real length (see the
-#: calibration table in README「服务拓扑」).
-_CAPACITY_ERROR_MARKERS = (
-    "too large to process",
-    "larger than the max context size",
-    "exceeds the available context size",
-)
-
-
-def _error_message(response: httpx.Response, *, limit: int = 200) -> str:
-    """Best-effort read of a provider's error text; never the request payload we sent."""
-    decoded: object = None
-    with contextlib.suppress(ValueError):
-        decoded = response.json()
-    message = ""
-    if isinstance(decoded, dict):
-        error = decoded.get("error", decoded)
-        if isinstance(error, dict):
-            message = str(error.get("message") or "")
-        elif isinstance(error, str):
-            message = error
-        if not message:
-            message = str(decoded.get("message") or "")
-    if not message:
-        with contextlib.suppress(Exception):
-            message = response.text
-    return " ".join(message.split())[:limit]
-
-
-def _post_json(
-    client: httpx.Client,
-    path: str,
-    payload: dict[str, Any],
-    *,
-    attempts: int,
-    headers: dict[str, str],
-    what: str,
-) -> dict[str, Any] | list[Any]:
-    """POST with bounded retries; shared by the local embedding and rerank clients."""
-    last_timeout = False
-
-    for attempt in range(attempts):
-        try:
-            response = client.post(path, json=payload, headers=headers)
-        except httpx.TimeoutException:
-            last_timeout = True
-            if attempt + 1 >= attempts:
-                break
-            time.sleep(1 if attempt == 0 else 2)
-            continue
-        except httpx.RequestError as exc:
-            if attempt + 1 >= attempts:
-                logger.warning("Local %s connection failure (%s)", what, type(exc).__name__)
-                raise ProviderError(
-                    "model_provider_unavailable",
-                    f"The {what} server is temporarily unavailable.",
-                    status_code=503,
-                    retry_after=5,
-                ) from None
-            time.sleep(1 if attempt == 0 else 2)
-            continue
-
-        detail = _error_message(response) if response.is_error else ""
-        if response.is_error and any(marker in detail for marker in _CAPACITY_ERROR_MARKERS):
-            # Deterministic rejection: fail immediately instead of retrying a prompt that
-            # no number of attempts can shrink. The message carries the server's own limit.
-            logger.warning("Local %s server rejected an oversized input: %s", what, detail)
-            raise ProviderError(
-                "model_provider_input_too_large",
-                f"The {what} server rejected an input that is too long for the model.",
-                status_code=503,
-            )
-        if response.status_code in _RETRYABLE_STATUS and attempt + 1 < attempts:
-            time.sleep(1 if attempt == 0 else 2)
-            continue
-        if response.is_error:
-            status = response.status_code
-            logger.warning("Local %s server returned HTTP %d: %s", what, status, detail)
-            if status == 429:
-                raise ProviderError(
-                    "model_provider_rate_limited",
-                    f"The {what} server is rate limiting requests.",
-                    status_code=429,
-                    retry_after=5,
-                )
-            if status in {408, 504}:
-                raise ProviderError(
-                    "model_provider_timeout",
-                    f"The {what} server request timed out.",
-                    status_code=504,
-                )
-            raise ProviderError(
-                "model_provider_error",
-                f"The {what} server rejected or failed a request.",
-                status_code=503,
-                retry_after=5 if status >= 500 else None,
-            )
-        try:
-            decoded = response.json()
-        except (ValueError, json.JSONDecodeError):
-            raise ProviderError(
-                "model_provider_invalid_response",
-                f"The {what} server returned an invalid response.",
-                status_code=503,
-            ) from None
-        if not isinstance(decoded, (dict, list)):
-            raise ProviderError(
-                "model_provider_invalid_response",
-                f"The {what} server returned an invalid response.",
-                status_code=503,
-            )
-        return decoded
-
-    if last_timeout:
-        raise ProviderError(
-            "model_provider_timeout",
-            f"The {what} server request timed out.",
-            status_code=504,
-        )
-    raise ProviderError(
-        "model_provider_unavailable",
-        f"The {what} server is temporarily unavailable.",
-        status_code=503,
-        retry_after=5,
-    )
 
 
 class LocalEmbeddingProvider:
@@ -219,7 +85,7 @@ class LocalEmbeddingProvider:
         return {"Authorization": f"Bearer {api_key.get_secret_value()}"}
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        body = _post_json(
+        body = post_json(
             self._client,
             path,
             payload,
@@ -283,7 +149,7 @@ class LocalRerankProvider:
             "top_n": len(documents),
         }
         with self._rerank_slots:
-            body = _post_json(
+            body = post_json(
                 self._client,
                 "rerank",
                 payload,

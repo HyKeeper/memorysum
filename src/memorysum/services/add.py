@@ -379,6 +379,17 @@ class AddService:
                         diagnostics.get("embedding_inputs_embedded", 0)
                     ) + len(claims)
                 normalized, dimension = normalize_batch(vectors, len(claims))
+                declared = self._pipeline.embedding.dimension
+                if isinstance(declared, int) and dimension != declared:
+                    # Do not create vec0 tables for a dimension the pipeline did not
+                    # declare: Search would then compare a query vector from another
+                    # space against stored documents.
+                    raise ProviderError(
+                        "model_provider_invalid_embedding",
+                        f"The embedding provider returned {dimension}-dimension vectors, "
+                        f"but the pipeline declares {declared}.",
+                        status_code=503,
+                    )
                 connection = self._database.connect(reference, user_id)
                 try:
                     self._database.ensure_vector_tables(connection, dimension)
