@@ -17,6 +17,9 @@
   `MEMORYSUM_DASHSCOPE_BASE_URL` 覆盖。公共端点实测会忽略 `dimension` 返回 1024 维，
   用专用 MaaS 部署时把 base URL 指过去（见「踩过的坑」第 52 条）。
 - 另一家可选远程供应商：`openrouter`（OpenAI 兼容 `/embeddings` + `/rerank`），两段可混用。
+- 常驻方式：systemd **用户**单元 `memorysum.service`（仓库内 `deploy/memorysum.service`，
+  `Restart=always`，`Linger=yes` 开机自启）；日志进 journal（`journalctl --user -u memorysum -f`），
+  不再写 `logs/memorysum.log`，避免长期运行写满磁盘。
 
 > **本仓库不再包含任何本地模型部署路径**：`providers/local_openai.py` 已删除，
 > `MEMORYSUM_EMBEDDING_BASE_URL` / `MEMORYSUM_RERANK_BASE_URL` / `MEMORYSUM_*_API_KEY`
@@ -38,7 +41,9 @@
 - 只需要一个进程 + 一个模型 API key，没有本地模型服务要起：
   ```bash
   export DASHSCOPE_API_KEY='sk-...'            # 唯一必需的外部凭据
-  .venv/bin/memorysum                          # :8001
+  .venv/bin/memorysum                          # 前台跑 :8001
+  systemctl --user restart memorysum           # 生产：systemd 用户单元
+  journalctl --user -u memorysum -f            # 生产：跟随日志
   ```
 - 常用命令（**都用 `.venv/bin/*`，不要用 `uv run`**）：
   ```bash
@@ -285,6 +290,8 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
   [ "$NEW" != "$REAL" ] && echo "真的换了进程 ✅" || echo "没重启成功 ❌"
   ```
   停机实测 4.5~6.0 s（有平台 keep-alive 连接时）。
+  **（2026-11-02 起）生产跑在 systemd 用户单元下，优先用 `systemctl --user restart memorysum`**：
+  单元带 `Restart=always`，重启停机实测 ~1 s；日志用 `journalctl --user -u memorysum -f`。
 - **只有 memorysum 一个常驻进程**，机器重启不自动恢复（尚无 systemd unit）。模型调用走远程 API，
   所以 8001 起得来就能服务；模型侧不可达时 Add/Search 返回 503，不会本地兜底。
 - **日志时间戳是 UTC（带 Z），与本地时间差 8 小时**：专家说「14:26 出 400」要在日志里查 `T06:26`——排查时间点先转换（2026-10-15 实测确认）。
@@ -302,6 +309,11 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
 - 提交信息用英文祈使句标题 + 要点式正文，说明**改了什么、依据是什么**；实测结论要写进提交或 README。
 
 ## 本地复现平台能力树评分（2026-10-14 建立）
+
+> **本地备份已清空（2026-11-02）**：`backups/` 下约 60 GB 历史数据（各轮 requests / scope 快照 /
+> 编码实验轨迹）已按用户要求删除，下面出现的 `backups/...` 路径需要重跑脚本重新生成
+> （如 `scripts/extract_loadtest_requests.py`、`scripts/fetch_platform_results.py --save-tree`）。
+> `docs/score_ledger.md` 等分析结论仍在 `docs/`。
 
 > **先看这一条（2026-10-14 19:40 新增）**：平台分数**已经可以直接读**，不需要再用下面的方法反推。
 > `.venv/bin/python scripts/fetch_platform_results.py --leaves` 会打出**六轮 × 20 个叶子的原始分数**，

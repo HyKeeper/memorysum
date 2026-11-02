@@ -1,0 +1,22 @@
+[Unit]
+Description=MemorySum source-faithful memory retrieval service (Add/Search)
+Documentation=https://github.com/HyKeeper/memorysum
+# The service calls hosted model APIs; without a route it can only answer 503.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/memorysum
+# Optional: tolerate a missing .env (use `Environment=`/`set-environment` instead).
+EnvironmentFile=-%h/memorysum/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/memorysum/.venv/bin/memorysum
+# Always come back: a model API outage returns 503 per request, it must not kill the unit.
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target

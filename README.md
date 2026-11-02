@@ -106,12 +106,17 @@ echo 'your-caller-token' > keys.txt
 # 直接 `uvicorn memorysum.asgi:app` 不会读 .env，必须先把环境变量 export 好。
 ```
 
-后台运行：
+长期运行用 systemd 用户单元（`deploy/memorysum.service`，`Restart=always`，日志进 journal）：
 
 ```bash
-mkdir -p logs
-set -a; . ./.env; set +a
-setsid nohup .venv/bin/memorysum > logs/memorysum.log 2>&1 &
+mkdir -p ~/.config/systemd/user
+cp deploy/memorysum.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now memorysum     # 开机自启（需 loginctl enable-linger $USER）
+
+systemctl --user status memorysum            # 运行状态
+journalctl --user -u memorysum -f            # 跟随日志
+systemctl --user restart memorysum           # 重启（停机 ~1s）
 ```
 
 ### 4. 验证
@@ -303,13 +308,17 @@ Content-Type: application/json
 
 ## 运行与重启
 
+生产运行交给 systemd 用户单元；`Restart=always` 会在崩溃或依赖重启后自动拉起：
+
 ```bash
-REAL=$(ss -tlnpH 'sport = :8001' | grep -oP 'pid=\K[0-9]+' | head -1)
-kill -TERM $REAL; sleep 2; kill -9 $REAL 2>/dev/null
-setsid nohup .venv/bin/memorysum > logs/memorysum.log 2>&1 &
-sleep 4
-ss -tlnpH 'sport = :8001'   # 确认 PID 变了
+systemctl --user restart memorysum          # 重启
+systemctl --user status memorysum           # 状态 / PID / 内存
+journalctl --user -u memorysum -n 50        # 最近日志
+journalctl --user -u memorysum -f           # 跟随
 ```
+
+日志写进 journal（自动轮转），不再落 `logs/memorysum.log`，避免长期运行把磁盘写满。
+没有 systemd 的环境可以前台跑 `.venv/bin/memorysum`，或用 `setsid nohup … > logs/memorysum.log 2>&1 &`。
 
 ## 目录结构
 
@@ -323,6 +332,7 @@ memorysum/
 │   ├── services/           # AddService / SearchService
 │   ├── storage/            # SQLite 数据库管理
 │   └── settings.py         # 配置加载
+├── deploy/                 # systemd 用户单元（memorysum.service）
 ├── tests/                  # 测试（mock transport，不触网）
 ├── data/                   # 运行时数据（不提交）
 ├── logs/                   # 日志（不提交）
