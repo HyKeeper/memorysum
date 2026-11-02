@@ -165,3 +165,25 @@ def test_evidence_purification_requires_an_explicit_endpoint():
         EvidencePurifyConfig(enabled=True)
     enabled = EvidencePurifyConfig(enabled=True, endpoint="https://decision.example/v1/decide")
     assert enabled.endpoint.startswith("https://")
+
+
+def test_cli_loads_dotenv_from_the_working_directory(tmp_path, monkeypatch):
+    """A wheel install must still read the project's own `.env` (not site-packages')."""
+    import os
+
+    from memorysum.cli import _load_env_file
+
+    (tmp_path / ".env").write_text(
+        "MEMORYSUM_DOTENV_PROBE=from-file\nMEMORYSUM_EXPORTED_PROBE=from-file\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEMORYSUM_DOTENV_PROBE", raising=False)
+    monkeypatch.setenv("MEMORYSUM_EXPORTED_PROBE", "from-environment")
+    try:
+        _load_env_file()
+        assert os.environ["MEMORYSUM_DOTENV_PROBE"] == "from-file"
+        # Exported variables win: load_dotenv(override=False).
+        assert os.environ["MEMORYSUM_EXPORTED_PROBE"] == "from-environment"
+    finally:
+        os.environ.pop("MEMORYSUM_DOTENV_PROBE", None)

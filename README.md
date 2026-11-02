@@ -83,6 +83,9 @@ echo 'your-caller-token' > keys.txt
 
 环境变量只放**密钥、服务地址、数据目录、入站鉴权**；算法参数一律在 `champion-v1.json`。
 
+> 当前工作目录的 `.env` 会被**自动读取**（`load_dotenv(override=False)`）；已经 `export` 的变量优先，
+> 不会被 `.env` 覆盖。工作目录没有 `.env` 时，才回退到按包文件位置向上查找。
+
 | 变量 | 作用 |
 |---|---|
 | `DASHSCOPE_API_KEY` / `MEMORYSUM_DASHSCOPE_API_KEY` | DashScope 密钥（后者优先） |
@@ -99,7 +102,8 @@ echo 'your-caller-token' > keys.txt
 
 ```bash
 .venv/bin/memorysum
-# 等价于 uvicorn memorysum.asgi:app --host 0.0.0.0 --port 8001
+# 内部就是 uvicorn（host/port 取自 MEMORYSUM_HOST 与固定 8001），但会先 load_dotenv()。
+# 直接 `uvicorn memorysum.asgi:app` 不会读 .env，必须先把环境变量 export 好。
 ```
 
 后台运行：
@@ -113,7 +117,8 @@ setsid nohup .venv/bin/memorysum > logs/memorysum.log 2>&1 &
 ### 4. 验证
 
 ```bash
-# 健康检查：缺模型凭据时直接 503，不会等到第一次 Add/Search 才暴露
+# 健康检查：**缺**模型凭据时直接 503（只校验"是否配置"，不校验 key 是否有效；
+# 无效 key 仍返回 200，第一次 Add/Search 时才会 503 model_provider_unauthorized）
 curl http://localhost:8001/health
 # → {"status":"ok"}
 
@@ -339,7 +344,17 @@ memorysum/
 
 ### Search 返回 503
 
-按日志里的 `model_provider_*` code 判断是哪一侧失败：
+先看**响应体**的 `detail.code`（`model_provider_*`），它直接指出是哪一侧失败：
+
+```json
+{"detail":{"code":"model_provider_unauthorized",
+           "message":"The DashScope embedding provider rejected the configured credentials."}}
+```
+
+日志里默认只有供应商的原始错误文本（例如 `DashScope embedding server returned HTTP 401: Invalid API-key provided`）
+和访问行；**结构化诊断行（`strategy` / `reranked` / `channel_hits`）需要 `MEMORYSUM_DEBUG=true`**，默认不写。
+
+手工验证两侧 API：
 
 ```bash
 # embedding（应返回 2048 维）
