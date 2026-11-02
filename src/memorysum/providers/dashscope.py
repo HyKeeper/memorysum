@@ -15,10 +15,10 @@ Embeddings — ``text-embedding-v4``:
     -> {"output": {"embeddings": [{"text_index": 0, "embedding": [...]}]},
         "usage": {"total_tokens": 23}, "request_id": "..."}
 
-Reranking — ``qwen3-rerank``:
+Reranking — ``qwen3.7-text-rerank`` (``qwen3-rerank`` works too):
 
     POST {base}/api/v1/services/rerank/text-rerank/text-rerank
-    {"model": "qwen3-rerank",
+    {"model": "qwen3.7-text-rerank",
      "input": {"query": "...", "documents": ["...", "..."]},
      "parameters": {"return_documents": false, "top_n": 2}}
 
@@ -34,10 +34,10 @@ embedding API, 2026-11-02 for rerank):
 
 * embeddings: at most 10 inputs per request, 8,192 tokens per input, dimension
   one of 64/128/256/512/768/1024/1536/2048/3072;
-* rerank: at most 500 documents per request, 4,000 tokens per item (query or
-  document), and the request total
-  ``query_tokens * n_documents + document_tokens`` must stay under the model's
-  per-request budget.
+* rerank: at most 500 documents per request and 120,000 tokens per request for
+  ``qwen3.7-text-rerank``; each item (query or document) may hold up to 30,000
+  tokens (``qwen3-rerank`` allows 4,000 per item). The request total is
+  ``query_tokens * n_documents + document_tokens``.
 
 Omitting ``dimension`` silently yields the 1024-dimension default at the
 public endpoint, and the public endpoint was measured ignoring an explicit

@@ -238,7 +238,7 @@ def test_dashscope_rerank_uses_native_wire_contract_and_maps_indexes():
     assert request.url.path == _RERANK_PATH
     payload = json.loads(request.content)
     assert payload == {
-        "model": "qwen3-rerank",
+        "model": "qwen3.7-text-rerank",
         "input": {"query": "where is the key?", "documents": ["first passage", "second passage"]},
         "parameters": {"return_documents": False, "top_n": 2},
     }
@@ -290,7 +290,7 @@ def test_packaged_config_pins_an_api_only_pipeline():
     assert pipeline.embedding.dimension in SUPPORTED_DIMENSIONS
     # Reranking is a hosted API call as well: no local model process is involved.
     assert pipeline.reranker.provider == "dashscope"
-    assert pipeline.reranker.model == "qwen3-rerank"
+    assert pipeline.reranker.model == "qwen3.7-text-rerank"
     assert pipeline.evidence_purify.endpoint == ""
     # The provider/model/dimension are part of the data contract: switching embeddings
     # must invalidate every stored scope instead of mixing vector spaces.

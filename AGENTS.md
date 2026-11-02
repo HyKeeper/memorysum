@@ -4,14 +4,15 @@
 
 ## 项目是什么
 
-原文保真的记忆服务：`Add` 写入、`Search` 检索。FastAPI + SQLite（FTS5 + sqlite-vec）。**所有模型调用都是远程 HTTP API**：embedding 默认 DashScope `text-embedding-v4`（原生 text-embedding API，2048 维），reranker 默认 DashScope `qwen3-rerank`（原生 text-rerank API）。进程内不加载模型、不需要 GPU、不需要本地推理服务。**不生成答案，只返回可回溯到原文的证据片段。**
+原文保真的记忆服务：`Add` 写入、`Search` 检索。FastAPI + SQLite（FTS5 + sqlite-vec）。**所有模型调用都是远程 HTTP API**：embedding 默认 DashScope `text-embedding-v4`（原生 text-embedding API，2048 维），reranker 默认 DashScope `qwen3.7-text-rerank`（原生 text-rerank API）。进程内不加载模型、不需要 GPU、不需要本地推理服务。**不生成答案，只返回可回溯到原文的证据片段。**
 
 ## 当前形态（2026-11-02 起：纯 API）
 
 **一个常驻进程，两个远程模型端点**：
 - memorysum `:8001`（FastAPI 服务）
 - embedding：DashScope `text-embedding-v4`（`embedding.provider = "dashscope"`，2048 维）
-- rerank：DashScope `qwen3-rerank`（`reranker.provider = "dashscope"`）
+- rerank：DashScope `qwen3.7-text-rerank`（`reranker.provider = "dashscope"`；文档口径：500 条文档/请求、
+  30,000 token/条、120,000 token/请求，2026-11-02 实测 16 条文档 p50 134 ms）
 - 凭据：`DASHSCOPE_API_KEY`（或 `MEMORYSUM_DASHSCOPE_API_KEY`）；端点用
   `MEMORYSUM_DASHSCOPE_BASE_URL` 覆盖。公共端点实测会忽略 `dimension` 返回 1024 维，
   用专用 MaaS 部署时把 base URL 指过去（见「踩过的坑」第 52 条）。
@@ -144,7 +145,8 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
 25. **它唯一可用的能力是 `cite`（定位证据句）**：返回逐字片段 + 字符偏移 + 概率，概率是有效质量信号（>0.9 基本对，<0.3 基本噪声），人工核对 15 题里 10 题完美或相关。已集成成 `evidence_purify`（默认关，见 `core/evidence.py`），机制是给前 N 条记录加 `[Key evidence: …]` 前缀、原文完整保留。**六层失败即原样返回**，其中最关键的一层是"引用必须能在该条原文里逐字找到"——它让幻觉 span 无法进入响应。实测（LoCoMo 4 对话 320 题）：答题准确率 26.9% → 27.8%，+3 题（赢 7 输 4），**McNemar p=0.549 不显著**，收益全部来自 temporal 类。**注意：改 config 打开它必须重启服务才生效**（进程内没有调用代码时改配置无用）。
 26. **LLM judge 的噪声是系统性的，不是随机的**：同一输入重复判 5 次结果稳定，但语义相同的不同表述会判出相反结论（gold=`Oliver, Luna, Bailey` 时 `Luna and Oliver` 判对而 `Oliver and Luna` 判错）——**投票治不了**。必须"规则优先 + LLM 兜底"：gold 是列表就要求元素全中、含数字就要求数字全中并做数字词映射（four→4、twice→2）、明确说不知道直接判错，其余才交给 LLM。规则命中率 85% 时判定才稳定。**代价是绝对数字大降**：同一批题从宽松 LLM judge 的 62.5% 掉到真实的 26.9%，旧的虚高数字不能用来汇报。参考实现见 `/home/rain/bench/judge_v2.py`。
 27. **统计功效**：40 题的 A/B 只能检测 >8% 的效应，"赢 2 输 2"无法区分有无；**+2% 需要约 1500 题**，+5% 需要约 300 题。配对设计看的是"赢/输比例是否显著偏离 1:1"（McNemar），不是净值 —— 即使拿到"赢 10 输 8"也不显著（p≈0.81）。
-28. **rerank 服务的 `-ub` 是隐形上限，压测里的 503 就是它**：`--pooling rank` 让 `slot.can_split()` 为 false，**每对 (query, document) 必须整体进一个物理 batch**，超了 llama.cpp 直接 500：`input (3648 tokens) is too large to process. increase the physical batch size (current batch size: 2048)`。而 `champion-v1.json` 的 `reranker.single_pair_proxy_tokens` 才是管线以为的上限 → 服务端参数与配置不一致，等于静默丢了能力。2026-10-14 压测：`-ub 2048` + 一条 9050 字符 query（pair 3648 token）→ 失败被重试 23 次、每次卡 3027 ms 后 503；`-ub 8192` 后同一请求 200/289 ms。**（自建 reranker 时期）启动参数必须满足 `-ub ≥ 单对预算的最坏真实长度`**（llama.cpp 会把 `-c` 压回模型训练窗口 8192 并告警，所以 8192 就是天花板；实测 `-ub 16384` 只多占 576MB 显存、没有任何收益）。当前改走托管 API 后，这条只解释为什么预算要保守：单条上限由服务端声明（qwen3-rerank 为 4,000 token/item）。
+28. **rerank 服务的 `-ub` 是隐形上限，压测里的 503 就是它**：`--pooling rank` 让 `slot.can_split()` 为 false，**每对 (query, document) 必须整体进一个物理 batch**，超了 llama.cpp 直接 500：`input (3648 tokens) is too large to process. increase the physical batch size (current batch size: 2048)`。而 `champion-v1.json` 的 `reranker.single_pair_proxy_tokens` 才是管线以为的上限 → 服务端参数与配置不一致，等于静默丢了能力。2026-10-14 压测：`-ub 2048` + 一条 9050 字符 query（pair 3648 token）→ 失败被重试 23 次、每次卡 3027 ms 后 503；`-ub 8192` 后同一请求 200/289 ms。**（自建 reranker 时期）启动参数必须满足 `-ub ≥ 单对预算的最坏真实长度`**（llama.cpp 会把 `-c` 压回模型训练窗口 8192 并告警，所以 8192 就是天花板；实测 `-ub 16384` 只多占 576MB 显存、没有任何收益）。当前改走托管 API 后，这条只解释为什么预算要保守：单条上限由服务端声明（qwen3.7-text-rerank 为 30,000 token/item、
+120,000 token/请求；旧的 qwen3-rerank 只有 4,000 token/item）。
 29. **代理分词器会低估真实 token，方向还很反直觉**：`reader_token_count()`（tiktoken cl100k）与 `bge-reranker-v2-m3` 的 XLM-R sentencepiece 实测（`scripts/calibrate_rerank_tokens.py`，1330 条真实 memory + 对抗样本）：中位 1.166、p99 1.357、**最坏 1.479**——**低估在英文/URL/标点那侧**（URL/UUID 1.479、标点密集 1.334），中日韩俄阿反而都 <0.7（中文 0.57）。所以 `single_pair_proxy_tokens` 从 8192 降到 **4608**（4608×1.479≈6814，留 17% 余量）；`max_query_proxy_tokens = 6144` 从硬编码搬进 config。换模型/tokenizer 后重跑标定脚本（不安全时非 0 退出）。**别名音：不要再用「低估约 3%」这种估算——3% 只是那种英文语料下的巧合值。**
 30. **并发长 pair 不是悬崖，但延迟会排队**：4×3570、6×3570、8×6970 token 并发（合计最高 55.7k，远超 8192 的 unified KV）实测全部 200，n_slots=4 下 p50 3.3s / max 5.8s。所以修掉单对上限后不需要为此再限并发。
 31. **候选全部超预算不能返回空数组**：旧代码在 `entries` 为空时直接返回 `data=[]`（靠「query 上限 + 预算」两个常量凑巧不冲突才没爆），一旦 query 变长就会让调用方以为「没有相关记忆」。现在退回融合排序（策略 `hybrid_retrieval_unreranked` + WARNING），证据照常返回。

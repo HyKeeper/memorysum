@@ -74,21 +74,29 @@ def test_pipeline_falls_back_to_base_weight_for_unlisted_channels():
 def test_rerank_budgets_stay_under_the_hosted_per_item_limit():
     """The reranker is a hosted API with hard per-item limits.
 
-    DashScope ``qwen3-rerank`` accepts at most 4,000 tokens per item (query or document)
-    and rejects longer input with HTTP 400 instead of truncating. The pipeline compares
-    those limits against tiktoken's cl100k estimate, which can undercount real tokens
-    (measured worst ratio 1.494 over 1,335 real memory chunks plus adversarial samples,
-    2026-10-14). Both budgets therefore have to keep ``proxy * 1.494`` under 4,000.
+    DashScope ``qwen3.7-text-rerank`` accepts at most 30,000 tokens per item and
+    120,000 tokens per request, and rejects longer input with HTTP 400 instead of
+    truncating. The pipeline compares those limits against tiktoken's cl100k estimate,
+    which can undercount real tokens (measured worst ratio 1.494 over 1,335 real memory
+    chunks plus adversarial samples, 2026-10-14). So both the per-item and per-request
+    products have to stay under the documented limits.
     """
     from memorysum.settings import load_pipeline_config
 
     worst_measured_ratio = 1.494
-    per_item_limit = 4000
+    per_item_limit = 30_000
+    per_request_limit = 120_000
 
     reranker = load_pipeline_config().reranker
     assert reranker.enabled is True
     assert reranker.single_pair_proxy_tokens * worst_measured_ratio <= per_item_limit
     assert reranker.max_query_proxy_tokens * worst_measured_ratio <= per_item_limit
+    # The query is repeated for every document in a request, so the worst case is
+    # `batch_groups * max(pair, query)` proxies.
+    worst_request = reranker.batch_groups * max(
+        reranker.single_pair_proxy_tokens, reranker.max_query_proxy_tokens
+    )
+    assert worst_request * worst_measured_ratio <= per_request_limit
     # One request stays far below the documented 500-document cap.
     assert reranker.batch_groups <= 500
 

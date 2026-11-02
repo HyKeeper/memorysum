@@ -1,42 +1,63 @@
 # MemorySum
 
-原文保真的记忆检索服务：`Add` 写入、`Search` 检索。FastAPI + SQLite（FTS5 + sqlite-vec）。
+**原文保真的记忆检索服务**：`Add` 写入、`Search` 检索。FastAPI + SQLite（FTS5 + sqlite-vec）。
 
-**所有模型调用都走远程 HTTP API**：embedding 与 rerank 默认都由阿里云 DashScope 提供（原生 API），
-进程内不加载任何模型、不需要 GPU、也不需要在本机跑推理服务。换供应商只需改 `champion-v1.json`
-（也支持 OpenRouter）。**不生成答案，只返回可回溯到原文的证据片段。**
+- **5 路召回 + 自适应 RRF + 远程精排**：2 路稠密向量（sqlite-vec KNN）+ 2 路词法（FTS5，中英各一）+ 1 路选项索引，
+  融合后再交给托管 cross-encoder 重排，精排排名与检索排名二次融合，不丢通道共识。
+- **100% 远程 API**：embedding 与 rerank 默认都由阿里云 DashScope 提供（原生 API），进程内不加载任何模型，
+  不需要 GPU、不需要下载权重、不需要本机推理服务。换供应商只改一个 JSON 字段。
+- **原文逐字可回溯**：只存原始消息与 Unicode 区间，响应正文永远是原文切片（可加角色/时间锚点前缀，但不改写正文）。
+- **参数可审计、数据契约带指纹**：算法参数全在 `champion-v1.json`；换 embedding 模型/维度/端点会让旧 scope
+  按设计 503，绝不把不同向量空间混进同一张表。
 
 ## 架构概览
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Client (Add / Search)                                  │
-└────────────────────┬────────────────────────────────────┘
-                     │ :8001
-┌────────────────────▼────────────────────────────────────┐
-│  MemorySum Service (FastAPI + SQLite)                   │
-│  ┌──────────┐  ┌───────────┐  ┌───────────────────┐    │
-│  │ FTS5     │  │ sqlite-vec│  │ RRF 融合 + 精排   │    │
-│  │ (词法)   │  │ (向量)    │  │ (fusion_weight)   │    │
-│  └──────────┘  └───────────┘  └─────────┬─────────┘    │
-└──────────────────────────────────────────┼──────────────┘
-                                           │ HTTPS
-                     ┌─────────────────────▼─────────────────────┐
-                     │ 模型 API（远程）                          │
-                     │ embedding: text-embedding-v4 (2048 维)   │
-                     │ rerank:    qwen3-rerank                   │
-                     └───────────────────────────────────────────┘
+                 ┌────────────────────────────────────────────────────┐
+  Add / Search ─▶│  FastAPI 服务  :8001                                │
+                 │  SQLite：原文消息 · 窗口 · FTS5 索引 · sqlite-vec   │
+                 └───────────────────────┬────────────────────────────┘
+                                         │ 查询
+      ┌──────────────────────────────────┴──────────────────────────────────┐
+      │  5 路召回（并行）                                                    │
+      │                                                                     │
+      │  向量通道 — sqlite-vec KNN（2048 维，DashScope text-embedding-v4）  │
+      │    ① leaf_dense      叶子窗口 256 字符：精确片段                     │
+      │    ② context_dense   上下文窗口 320 字符：跨消息拼接                 │
+      │  词法通道 — SQLite FTS5 / BM25                                       │
+      │    ③ english_fts     porter+unicode61：英文词与代码标识符            │
+      │    ④ chinese_fts     jieba 分词：中文（对英文同样产出词项）          │
+      │    ⑤ options_lexical 选项索引：选择题的候选项命中                    │
+      └──────────────────────────────────┬──────────────────────────────────┘
+                                         ▼
+                     RRF 融合：k=20 自适应 + 逐通道权重 + 去重
+                                         ▼
+              远程精排 qwen3.7-text-rerank（DashScope 原生 text-rerank）
+                         └─ 与检索排名再融合（fusion_weight=2.0）
+                                         ▼
+              输出预算（条数/单条 token）+ 时间锚点 + 原文逐字切片
 ```
 
-### 检索流程
+### 5 路召回明细（默认权重）
 
-1. **5 路召回**：leaf_dense / context_dense / english_fts / chinese_fts / options_lexical
-2. **RRF 融合**：`rrf_k=20` + 自适应（`k = clamp(候选数/3, 10, 30)`）
-3. **Reranker 精排**：远程 cross-encoder（默认 `qwen3-rerank`）
-4. **最终排序**：`score = 1/(k + rerank_rank) + fusion_weight/(k + retrieval_rank)`
+| 通道 | 实现 | 权重 | ordinary 候选 | wide 候选 |
+|---|---|---|---|---|
+| `leaf_dense` | sqlite-vec KNN，leaf 窗口（256 字符） | 2.0 | 96 | 128 |
+| `context_dense` | sqlite-vec KNN，context 窗口（320 字符，跨消息） | 1.0 | 48 | 64 |
+| `english_fts` | FTS5 `porter unicode61` | 0.5 | 80 | 96 |
+| `chinese_fts` | FTS5 + jieba 分词 | 0.25 | 24 | 32 |
+| `options_lexical` | 选项 FTS（仅请求带 `options` 时命中） | 1.0 | 16 | 16 |
 
-精排只重排、不取代检索排序：融合项保留了多通道共识信号，实测纯精排排序在两个半样本上分别是
-+4 / −3，融合后为 +4 / 0。
+候选去重后上限 384（wide 512）。`per_source_cap=1`：同一个 chunk 最多贡献 1 条，
+避免一个话多的会话把 top-k 占满、挤掉多跳题的第二处证据。
+
+### 排序
+
+1. **RRF 融合**：`rrf_k=20` + 自适应（`k = clamp(去重候选数/3, 10, 30)`）。k=60 是 TREC 规模语料的取值，
+   我们的候选只有 40~500 条，固定 60 会让头部几乎没有优势。
+2. **精排**：远程 cross-encoder 给候选打分（按 `batch_groups=16` 分批、`max_concurrency=4`）。
+3. **二次融合**：`score = 1/(k + rerank_rank) + fusion_weight/(k + retrieval_rank)`，`fusion_weight=2.0`。
+   精排只重排、不取代检索排序——纯精排排序在两个半样本上分别是 +4 / −3，融合后是 +4 / 0。
 
 ## 快速开始
 
@@ -105,7 +126,7 @@ curl -sS "$MEMORYSUM_DASHSCOPE_BASE_URL/api/v1/services/embeddings/text-embeddin
 # 直连 rerank API（应返回 output.results，含 relevance_score）
 curl -sS "$MEMORYSUM_DASHSCOPE_BASE_URL/api/v1/services/rerank/text-rerank/text-rerank" \
   -H "Authorization: Bearer $DASHSCOPE_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3-rerank","input":{"query":"capital of France?","documents":["Paris.","Bananas."]},"parameters":{"return_documents":false,"top_n":2}}'
+  -d '{"model":"qwen3.7-text-rerank","input":{"query":"capital of France?","documents":["Paris.","Bananas."]},"parameters":{"return_documents":false,"top_n":2}}'
 
 # 添加记忆
 curl -X POST http://localhost:8001/add \
@@ -134,11 +155,11 @@ curl -X POST http://localhost:8001/search \
 
 | provider | embedding | rerank | 端点 / 凭据 |
 |---|---|---|---|
-| `dashscope`（默认） | `text-embedding-v4`（2048 维，需显式声明） | `qwen3-rerank` | `MEMORYSUM_DASHSCOPE_BASE_URL` + `DASHSCOPE_API_KEY` |
+| `dashscope`（默认） | `text-embedding-v4`（2048 维，需显式声明） | `qwen3.7-text-rerank` | `MEMORYSUM_DASHSCOPE_BASE_URL` + `DASHSCOPE_API_KEY` |
 | `openrouter` | config 指定（OpenAI 兼容 `/embeddings`） | config 指定（`/rerank`） | `OPENROUTER_BASE_URL` + `OPENROUTER_API_KEY` |
 
 两段可以混用（例如 DashScope embedding + OpenRouter rerank），由 `SplitProvider` 组合；
-同一供应商时共用一个 HTTP 客户端。两个供应商都实现 embedding 与 rerank，不再有"只能做一半"的 provider。
+同一供应商时共用一个 HTTP 客户端。两个供应商都实现 embedding 与 rerank。
 
 > 进程内不加载模型，也没有任何隐式本地端点：**不存在** `127.0.0.1:7999/7997` 之类的回退地址，
 > 缺凭据就是 503 `model_provider_not_configured`，不会静默降级。
@@ -179,16 +200,21 @@ Content-Type: application/json
 > 本实现**没有**设置它：查询与文档走同一编码模式。若将来要用，必须同时改
 > `ModelProvider.embed` 的角色参数并 bump `embedding_space_id`，不能只在一侧加前缀。
 
-### Rerank：DashScope `qwen3-rerank`
+### Rerank：DashScope `qwen3.7-text-rerank`
 
-**请求契约**（2026-11-02 实测）：
+默认精排模型是 **`qwen3.7-text-rerank`**：DashScope 文档把它标为推荐模型，且 `gte-rerank-v2`
+已于 2026-05-30 停止服务。相比上一代 `qwen3-rerank`，它的输入预算宽得多——单条 30,000 token
+（4,000 → 30,000）、单请求 120,000 token，单请求最多 500 条文档，覆盖 201 种语言，并支持
+`instruct` 指令（文档口径；本仓库实测 2026-11-02 该端点返回 200/0.16s）。
+
+**请求契约**：
 
 ```http
 POST {base}/api/v1/services/rerank/text-rerank/text-rerank
 Authorization: Bearer $DASHSCOPE_API_KEY
 Content-Type: application/json
 
-{"model":"qwen3-rerank",
+{"model":"qwen3.7-text-rerank",
  "input":{"query":"...", "documents":["...","..."]},
  "parameters":{"return_documents":false, "top_n":2}}
 ```
@@ -196,22 +222,34 @@ Content-Type: application/json
 响应：
 
 ```json
-{"output":{"results":[{"index":0,"relevance_score":0.8137},
-                      {"index":1,"relevance_score":0.1781}]},
- "usage":{"total_tokens":54},"request_id":"..."}
+{"output":{"results":[{"index":0,"relevance_score":0.9385},
+                      {"index":1,"relevance_score":0.0015}]},
+ "usage":{"prompt_tokens":52,"total_tokens":52},"request_id":"..."}
 ```
 
-要点：
+**本机实测**（同一端点、同一 16 条文档 payload、各 5 次）：
 
-- `relevance_score` 是 **request 内相对分数**（0~1，越大越相关），跨请求不可比。管线只使用它诱导的
+| 模型 | p50 延迟 | total_tokens |
+|---|---|---|
+| `qwen3.7-text-rerank` | **134 ms** | 691 |
+| `qwen3-rerank` | 180 ms | 707 |
+
+**工程约束**：
+
+- `relevance_score` 是 **request 内相对分数**（0~1，越大越相关），跨请求不可比。管线只消费它诱导的
   **排名**（`_fuse_rankings` 按 rank 融合），所以请求内归一化没有影响。
-- 每请求最多 **500 条文档**、每条（query 或 document）最多 **4,000 token**；实现整体送 `top_n = len(documents)`，
-  少返回一条就按 `model_provider_invalid_rerank` 失败，绝不静默丢候选。
-- 超长输入服务端返回 **HTTP 400 且不截断**。因此 `reranker.single_pair_proxy_tokens` 与
-  `reranker.max_query_proxy_tokens` 都按"代理计数 × 1.494 < 4,000"标定（代理计数会低估真实 token，
-  见 `tests/test_settings.py`）。超预算的候选不会被丢弃：不精排、按融合次序接在精排结果之后返回。
-- `reranker.instruction` 非空时会拼进 query 文本；DashScope 的 `parameters.instruct` 不重复设置。
+- 整体送 `top_n = len(documents)`；少返回一条就按 `model_provider_invalid_rerank` 失败，**绝不静默丢候选**。
+- 超长输入服务端返回 **HTTP 400 且不截断**。`reranker.single_pair_proxy_tokens` 与
+  `reranker.max_query_proxy_tokens` 都是 4096，按"代理计数 × 1.494 < 单条上限"标定；
+  最坏请求量 `16 × 4096 × 1.494 ≈ 98k`，仍在 120k/请求 之内（`tests/test_settings.py` 守护）。
+  超预算的候选不会被丢弃：不精排、按融合次序接在精排结果之后返回。
+- `reranker.instruction` 非空时会拼进 query 文本；DashScope 的 `parameters.instruct` 不重复设置，
+  默认使用模型自带的检索指令。
 - 精排是可选加速项：`reranker.enabled=false` 时直接使用 RRF 分数，行为与"没有精排服务"完全一致。
+
+**为什么用它**：一次请求能吞下 100 个候选分组（每批 16 条、4 批并发），单条能装下整段上下文窗口，
+延迟在 100~200 ms 量级；结果只作为排名参与融合，所以模型换代（换 `reranker.model`）不会改变数据契约，
+**不需要 bump `pipeline_id`**，也不影响已入库数据。
 
 ## 配置
 
@@ -227,9 +265,10 @@ Content-Type: application/json
 | `embedding.dimension` | 2048 | 必须显式；与响应不一致会 503 |
 | `embedding.batch_items` | 10 | DashScope 单请求上限也是 10 |
 | `reranker.provider` | `dashscope` | 供应商（`dashscope` / `openrouter`） |
-| `reranker.model` | `qwen3-rerank` | |
-| `reranker.single_pair_proxy_tokens` | 2560 | 单对（query+document）代理预算 |
-| `reranker.max_query_proxy_tokens` | 2048 | 超长 query 的裁剪阈值 |
+| `reranker.model` | `qwen3.7-text-rerank` | |
+| `reranker.single_pair_proxy_tokens` | 4096 | 单对（query+document）代理预算 |
+| `reranker.max_query_proxy_tokens` | 4096 | 超长 query 的裁剪阈值 |
+| `reranker.batch_groups` / `max_concurrency` | 16 / 4 | 每请求文档数 / 并发请求数 |
 | `reranker.fusion_weight` | 2.0 | 精排 vs 检索的融合权重 |
 | `retrieval.rrf_k` | 20 | RRF 融合常数（越小头部优势越大） |
 | `retrieval.per_source_cap` | 1 | 每个 chunk 最多返回几条 |
@@ -311,7 +350,7 @@ curl -sS "$MEMORYSUM_DASHSCOPE_BASE_URL/api/v1/services/embeddings/text-embeddin
 # rerank
 curl -sS "$MEMORYSUM_DASHSCOPE_BASE_URL/api/v1/services/rerank/text-rerank/text-rerank" \
   -H "Authorization: Bearer $DASHSCOPE_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3-rerank","input":{"query":"ping","documents":["ping"]}}' | head -c 200
+  -d '{"model":"qwen3.7-text-rerank","input":{"query":"ping","documents":["ping"]}}' | head -c 200
 ```
 
 | code | HTTP | 触发条件 |

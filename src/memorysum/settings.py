@@ -57,7 +57,8 @@ class RerankerConfig(FrozenConfig):
     instruction: str
     #: 单条 (query, document) 的代理 token 预算（cl100k 估算值）。必须是**保守值**：
     #: 代理计数会低估真实 token（实测最坏 real/est ≈ 1.5），预算 ×1.5 仍要小于服务端
-    #: 单条上限（DashScope qwen3-rerank 为 4,000 token/item）才算安全。见 README「Rerank 后端」。
+    #: 单条上限（DashScope qwen3.7-text-rerank 为 30,000 token/item、120,000 token/请求）
+    #: 才算安全。见 README「Rerank 后端」。
     single_pair_proxy_tokens: int
     #: query(+options) 的代理 token 上限。超过时 query 会被裁成首尾两段再送去精排，
     #: 不返回 422（超长 query 仍然要交出证据）；与单条上限一起受服务端 4,000 token/item 约束。
