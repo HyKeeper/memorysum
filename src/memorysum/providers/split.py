@@ -1,8 +1,9 @@
-"""Route embedding and reranking to different providers.
+"""Route embedding and reranking to different hosted providers.
 
-Champion configs may pin a local embedding endpoint while the reranker stays on
-a hosted provider. `SplitProvider` keeps that split explicit so Add/Search keep
-depending on a single `ModelProvider`.
+A pipeline may use one vendor for embeddings and another for reranking.
+`SplitProvider` keeps that split explicit so Add/Search keep depending on a
+single `ModelProvider` while each stage keeps its own HTTP client and
+credentials.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 {
-  "pipeline_id": "memorysum-hybrid-dashscope-v0.6.0",
+  "pipeline_id": "memorysum-hybrid-dashscope-v0.7.0",
   "qualification_status": "provisional",
   "embedding": {
     "provider": "dashscope",
@@ -14,11 +14,11 @@
   "reranker": {
     "enabled": true,
     "fusion_weight": 2.0,
-    "provider": "local-openai",
-    "model": "bge-reranker-v2-m3",
+    "provider": "dashscope",
+    "model": "qwen3-rerank",
     "instruction": "",
-    "single_pair_proxy_tokens": 4608,
-    "max_query_proxy_tokens": 6144,
+    "single_pair_proxy_tokens": 2560,
+    "max_query_proxy_tokens": 2048,
     "ordinary_pair_proxy_budget": 48000,
     "wide_pair_proxy_budget": 48000,
     "ordinary_candidate_groups": 100,
@@ -115,7 +115,7 @@
   },
   "evidence_purify": {
     "enabled": false,
-    "endpoint": "http://127.0.0.1:8095/v1/decide",
+    "endpoint": "",
     "max_records": 3,
     "min_probability": 0.85,
     "min_chars": 15,

@@ -186,11 +186,16 @@ def create_app(
 
     @app.get("/health", response_model=None)
     def health() -> dict[str, str] | JSONResponse:
-        needs_openrouter = "openrouter" in {
-            pipeline.embedding.provider,
-            pipeline.reranker.provider,
+        # Both stages call hosted APIs, so a missing credential is a hard failure rather
+        # than something to discover on the first Add/Search.
+        credentials = {
+            "dashscope": runtime.dashscope_api_key,
+            "openrouter": runtime.openrouter_api_key,
         }
-        if services.owns_provider and needs_openrouter and runtime.openrouter_api_key is None:
+        providers = {pipeline.embedding.provider, pipeline.reranker.provider}
+        missing = sorted(name for name in providers if credentials.get(name) is None)
+        if services.owns_provider and missing:
+            logger.warning("Model provider credentials missing for %s", ", ".join(missing))
             return JSONResponse(
                 status_code=503,
                 content={"status": "unavailable"},

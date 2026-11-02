@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "memorysum"
 version = "0.1.0"
-description = "A source-faithful memory service for the Agent Memory Challenge textual track"
+description = "A source-faithful memory service: store raw messages, retrieve verbatim evidence (hosted embedding/rerank APIs only)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = { file = "LICENSE" }

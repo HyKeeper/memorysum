@@ -71,26 +71,26 @@ def test_pipeline_falls_back_to_base_weight_for_unlisted_channels():
         )
 
 
-def test_rerank_pair_budget_stays_conservative_under_the_model_window():
-    """Guard the calibration recorded in README「服务拓扑」.
+def test_rerank_budgets_stay_under_the_hosted_per_item_limit():
+    """The reranker is a hosted API with hard per-item limits.
 
-    The per-pair budget is compared against tiktoken's cl100k estimate, but the server
-    counts with the model's own XLM-R tokenizer, which splits English/URL/punctuation text
-    *more* finely. Measured over 1335 real memory chunks plus adversarial samples
-    (2026-10-14, `scripts/calibrate_rerank_tokens.py`): median 1.166, p99 1.357,
-    worst 1.494 real tokens per estimated token. Worse ratios only fail the whole Search,
-    so the budget must keep real tokens under the 8192 token model window with room to
-    spare - here 1.75x, i.e. ~17% beyond the worst ratio ever measured.
+    DashScope ``qwen3-rerank`` accepts at most 4,000 tokens per item (query or document)
+    and rejects longer input with HTTP 400 instead of truncating. The pipeline compares
+    those limits against tiktoken's cl100k estimate, which can undercount real tokens
+    (measured worst ratio 1.494 over 1,335 real memory chunks plus adversarial samples,
+    2026-10-14). Both budgets therefore have to keep ``proxy * 1.494`` under 4,000.
     """
     from memorysum.settings import load_pipeline_config
 
     worst_measured_ratio = 1.494
-    tolerated_ratio = 1.75
-    model_window = 8192
+    per_item_limit = 4000
 
     reranker = load_pipeline_config().reranker
-    assert reranker.single_pair_proxy_tokens * worst_measured_ratio <= model_window
-    assert reranker.single_pair_proxy_tokens * tolerated_ratio <= model_window
+    assert reranker.enabled is True
+    assert reranker.single_pair_proxy_tokens * worst_measured_ratio <= per_item_limit
+    assert reranker.max_query_proxy_tokens * worst_measured_ratio <= per_item_limit
+    # One request stays far below the documented 500-document cap.
+    assert reranker.batch_groups <= 500
 
 
 def test_rerank_query_cap_is_configured_and_finite():
@@ -123,3 +123,37 @@ def test_collapse_whitespace_is_idempotent_and_keeps_word_boundaries():
     # JSON 转义只在显式要求时处理（默认不改正文语义）
     assert collapse_whitespace('{\\"a\\": 1}') == '{\\"a\\": 1}'
     assert collapse_whitespace('{\\"a\\": 1}', unescape=True) == '{"a": 1}'
+
+
+def test_packaged_pipeline_calls_hosted_apis_only():
+    """The shipped config must not depend on a model running on the same machine."""
+    from memorysum.settings import load_pipeline_config
+
+    pipeline = load_pipeline_config()
+    hosted = {"dashscope", "openrouter"}
+    assert pipeline.embedding.provider in hosted
+    assert pipeline.reranker.provider in hosted
+    assert pipeline.evidence_purify.enabled is False
+
+
+def test_runtime_settings_expose_no_local_model_endpoints():
+    import dataclasses
+
+    from memorysum.settings import RuntimeSettings
+
+    fields = {field.name for field in dataclasses.fields(RuntimeSettings)}
+    assert not {
+        name for name in fields if "embedding_base_url" in name or "rerank_base_url" in name
+    }
+
+
+def test_evidence_purification_requires_an_explicit_endpoint():
+    from memorysum.settings import EvidencePurifyConfig
+
+    default = EvidencePurifyConfig()
+    assert default.enabled is False
+    assert default.endpoint == ""
+    with pytest.raises(ValueError, match="endpoint is required"):
+        EvidencePurifyConfig(enabled=True)
+    enabled = EvidencePurifyConfig(enabled=True, endpoint="https://decision.example/v1/decide")
+    assert enabled.endpoint.startswith("https://")

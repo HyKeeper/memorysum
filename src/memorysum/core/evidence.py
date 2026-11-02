@@ -1,6 +1,7 @@
-"""Optional evidence purification via a local THX-01 decision service.
+"""Optional evidence purification via an external decision API (THX-01 style).
 
-THX-01 is a 322M non-autoregressive "decision" model: one forward pass over
+The decision model (THX-01, 322M non-autoregressive) runs behind a remote HTTP
+endpoint configured in `evidence_purify.endpoint`: one forward pass over
 `state + question + options` returns calibrated option probabilities plus, with
 `cite: true`, the verbatim spans of the document that support the answer. That
 last part is what this module uses — not its ranking ability, which measured

@@ -12,8 +12,8 @@ from memorysum.core.errors import ProviderError
 from memorysum.core.ranking import reciprocal_rank_fusion
 from memorysum.core.rendering import render_response_spans
 from memorysum.core.vector import normalize_batch
+from memorysum.providers.dashscope import DashScopeProvider
 from memorysum.providers.factory import build_provider, embedding_endpoint
-from memorysum.providers.local_openai import LocalEmbeddingProvider
 from memorysum.providers.openrouter import OpenRouterProvider
 from memorysum.providers.protocols import RerankScore
 from memorysum.providers.split import SplitProvider
@@ -143,155 +143,109 @@ def test_openrouter_adapter_uses_expected_wire_contract_without_network():
     assert requests[0].headers["authorization"] == "Bearer test-provider-key"
 
 
-def _local_runtime(**overrides) -> RuntimeSettings:
+def _api_runtime(**overrides) -> RuntimeSettings:
     values = {
-        "data_root": Path("/tmp/memorysum-local-provider-test"),
+        "data_root": Path("/tmp/memorysum-provider-test"),
         "openrouter_base_url": "https://openrouter.ai/api/v1",
         "openrouter_api_key": SecretStr("test-provider-key"),
         "api_auth_scheme": "bearer",
         "api_auth_tokens": (SecretStr("test-memory-system-key"),),
         "host": "127.0.0.1",
         "port": 8001,
-        "embedding_base_url": "http://127.0.0.1:7999/v1",
+        "dashscope_base_url": "https://example.maas.aliyuncs.com",
+        "dashscope_api_key": SecretStr("test-dashscope-key"),
     }
     values.update(overrides)
     return RuntimeSettings(**values)
 
 
-def test_local_embedding_adapter_uses_openai_compatible_contract_without_network():
-    requests = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3.0, 4.0]}]})
-
-    provider = LocalEmbeddingProvider(
-        _local_runtime(embedding_api_key=None),
-        load_pipeline_config(),
-        transport=httpx.MockTransport(handler),
-    )
-    try:
-        assert provider.embed(["source passage"])[0] == [3.0, 4.0]
-        with pytest.raises(ProviderError) as error:
-            provider.rerank("question", ["first"])
-        assert error.value.code == "model_provider_not_configured"
-    finally:
-        provider.close()
-
-    request = requests[0]
-    assert request.url.host == "127.0.0.1"
-    assert request.url.port == 7999
-    assert request.url.path == "/v1/embeddings"
-    payload = json.loads(request.content)
-    assert payload["model"] == load_pipeline_config().embedding.model
-    assert payload["input"] == ["source passage"]
-    assert payload["encoding_format"] == "float"
-    assert "authorization" not in request.headers
+def _unit_vector(dimension: int) -> list[float]:
+    values = [0.0] * dimension
+    values[0] = 1.0
+    return values
 
 
-def test_local_embedding_adapter_sends_optional_bearer_key():
-    requests = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0, 0.0]}]})
-
-    provider = LocalEmbeddingProvider(
-        _local_runtime(embedding_api_key=SecretStr("local-embedding-secret")),
-        load_pipeline_config(),
-        transport=httpx.MockTransport(handler),
-    )
-    try:
-        provider.embed(["passage"])
-    finally:
-        provider.close()
-
-    assert requests[0].headers["authorization"] == "Bearer local-embedding-secret"
-
-
-def test_provider_factory_splits_local_embeddings_from_remote_rerank():
+def test_provider_factory_splits_dashscope_embeddings_from_openrouter_rerank():
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
-        if request.url.path.endswith("/embeddings"):
-            return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3.0, 4.0]}]})
+        if request.url.path.endswith("/text-embedding/text-embedding"):
+            return httpx.Response(
+                200,
+                json={
+                    "output": {"embeddings": [{"text_index": 0, "embedding": _unit_vector(2048)}]}
+                },
+            )
         return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.7}]})
 
     pipeline = load_pipeline_config()
-    # Pin both providers explicitly so this test does not depend on the packaged
-    # config's current choice (embedding is now DashScope by default).
+    # Both stages are hosted APIs; the mix here proves each stage keeps its own client.
     pipeline = pipeline.model_copy(
         update={
-            "embedding": pipeline.embedding.model_copy(update={"provider": "local-openai"}),
+            "embedding": pipeline.embedding.model_copy(update={"provider": "dashscope"}),
             "reranker": pipeline.reranker.model_copy(
-                update={"provider": "openrouter", "enabled": True}
+                update={"provider": "openrouter", "model": "cohere/rerank-v3.5", "enabled": True}
             ),
         }
     )
     provider = build_provider(
-        _local_runtime(),
+        _api_runtime(),
         pipeline,
         transport=httpx.MockTransport(handler),
     )
     try:
         assert isinstance(provider, SplitProvider)
-        assert provider.embed(["passage"]) == [[3.0, 4.0]]
+        assert len(provider.embed(["passage"])[0]) == 2048
         assert provider.rerank("question", ["first"]) == [RerankScore(0, 0.7)]
     finally:
         provider.close()
 
-    assert calls[0] == "http://127.0.0.1:7999/v1/embeddings"
+    assert (
+        calls[0]
+        == "https://example.maas.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding"
+    )
     assert calls[1] == "https://openrouter.ai/api/v1/rerank"
 
 
-def test_provider_factory_serves_local_rerank_endpoint_with_plain_list_response():
-    """Local embedding + local rerank must hit both local endpoints.
-
-    Also covers the bare-array response shape used by plain FastAPI rerank
-    services (``[{"index": i, "score": s}]``) rather than the OpenRouter shape.
-    """
-    calls: list[dict] = []
+def test_provider_factory_uses_one_client_when_both_stages_share_a_provider():
+    """DashScope serves embeddings *and* reranking, so no split client is needed."""
+    calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append({"url": str(request.url), "body": json.loads(request.content)})
-        if request.url.path.endswith("/embeddings"):
-            return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0, 2.0]}]})
-        return httpx.Response(200, json=[{"index": 0, "score": 0.9, "document": "first"}])
+        calls.append(str(request.url))
+        if request.url.path.endswith("/text-embedding/text-embedding"):
+            return httpx.Response(
+                200,
+                json={
+                    "output": {"embeddings": [{"text_index": 0, "embedding": _unit_vector(2048)}]}
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"output": {"results": [{"index": 0, "relevance_score": 0.9}]}},
+        )
 
-    pipeline = load_pipeline_config()
-    pipeline = pipeline.model_copy(
-        update={
-            "embedding": pipeline.embedding.model_copy(update={"provider": "local-openai"}),
-            "reranker": pipeline.reranker.model_copy(
-                update={"provider": "local-openai", "enabled": True}
-            ),
-        }
-    )
     provider = build_provider(
-        _local_runtime(),
-        pipeline,
-        transport=httpx.MockTransport(handler),
+        _api_runtime(), load_pipeline_config(), transport=httpx.MockTransport(handler)
     )
     try:
-        assert provider.embed(["passage"]) == [[1.0, 2.0]]
+        assert isinstance(provider, DashScopeProvider)
+        assert len(provider.embed(["passage"])[0]) == 2048
         assert provider.rerank("question", ["first"]) == [RerankScore(0, 0.9)]
     finally:
         provider.close()
 
-    assert calls[0]["url"] == "http://127.0.0.1:7999/v1/embeddings"
-    assert calls[1]["url"] == "http://127.0.0.1:7997/rerank"
-    assert calls[1]["body"]["query"] == "question"
-    assert calls[1]["body"]["documents"] == ["first"]
+    assert all("example.maas.aliyuncs.com" in url for url in calls)
+    assert calls[1].endswith("/api/v1/services/rerank/text-rerank/text-rerank")
 
 
-def test_local_rerank_oversized_input_fails_fast_instead_of_retrying(monkeypatch):
-    """Regression for the 2026-10-14 load test.
+def test_rerank_oversized_input_fails_fast_instead_of_retrying(monkeypatch):
+    """A deterministic capacity rejection must not burn the caller's deadline.
 
-    ``bge-reranker-v2-m3`` is served with ``--pooling rank``, so llama.cpp cannot split a
-    prompt across physical batches: a pair that does not fit in ``-ub`` is rejected with
-    HTTP 500. The server's answer is deterministic, so retrying only burns the caller's
-    deadline (measured: every failed Search stalled 3027 ms before returning 503).
+    Measured 2026-10-14 against a self-hosted cross-encoder: every failed Search stalled
+    ~3 s retrying the same too-long pair before returning 503. The shared HTTP client
+    recognises the capacity message and fails on the first answer.
     """
     monkeypatch.setattr(
         "memorysum.providers.http_post.time.sleep",
@@ -314,7 +268,7 @@ def test_local_rerank_oversized_input_fails_fast_instead_of_retrying(monkeypatch
         )
 
     provider = build_provider(
-        _local_runtime(), load_pipeline_config(), transport=httpx.MockTransport(handler)
+        _api_runtime(), load_pipeline_config(), transport=httpx.MockTransport(handler)
     )
     try:
         with pytest.raises(ProviderError) as error:
@@ -327,19 +281,22 @@ def test_local_rerank_oversized_input_fails_fast_instead_of_retrying(monkeypatch
     assert len(calls) == 1
 
 
-def test_local_rerank_transient_server_error_is_still_retried(monkeypatch):
-    """A 5xx without a capacity message stays retryable (slots may be busy)."""
+def test_rerank_transient_server_error_is_still_retried(monkeypatch):
+    """A 5xx without a capacity message stays retryable (the API may be briefly busy)."""
     monkeypatch.setattr("memorysum.providers.http_post.time.sleep", lambda _seconds: None)
     calls: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
         if len(calls) < 3:
-            return httpx.Response(500, json={"error": {"message": "slot unavailable"}})
-        return httpx.Response(200, json=[{"index": 0, "score": 0.7}])
+            return httpx.Response(500, json={"message": "service busy"})
+        return httpx.Response(
+            200,
+            json={"output": {"results": [{"index": 0, "relevance_score": 0.7}]}},
+        )
 
     provider = build_provider(
-        _local_runtime(), load_pipeline_config(), transport=httpx.MockTransport(handler)
+        _api_runtime(), load_pipeline_config(), transport=httpx.MockTransport(handler)
     )
     try:
         assert provider.rerank("question", ["first"]) == [RerankScore(0, 0.7)]
@@ -351,14 +308,9 @@ def test_local_rerank_transient_server_error_is_still_retried(monkeypatch):
 
 def test_embedding_endpoint_follows_the_configured_provider():
     pipeline = load_pipeline_config()
-    runtime = _local_runtime()
+    runtime = _api_runtime()
     assert pipeline.embedding.provider == "dashscope"
-    assert embedding_endpoint(runtime, pipeline) == "https://dashscope.aliyuncs.com"
-
-    local_pipeline = pipeline.model_copy(
-        update={"embedding": pipeline.embedding.model_copy(update={"provider": "local-openai"})}
-    )
-    assert embedding_endpoint(runtime, local_pipeline) == "http://127.0.0.1:7999/v1"
+    assert embedding_endpoint(runtime, pipeline) == "https://example.maas.aliyuncs.com"
 
     remote_pipeline = pipeline.model_copy(
         update={"embedding": pipeline.embedding.model_copy(update={"provider": "openrouter"})}
@@ -372,7 +324,7 @@ def test_factory_rejects_unknown_provider_in_config():
         update={"reranker": pipeline.reranker.model_copy(update={"provider": "mystery"})}
     )
     with pytest.raises(ValueError, match="Unsupported model provider"):
-        build_provider(_local_runtime(), broken)
+        build_provider(_api_runtime(), broken)
 
 
 def test_rerank_fusion_blends_rerank_and_retrieval_rankings():

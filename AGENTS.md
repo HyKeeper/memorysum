@@ -4,28 +4,28 @@
 
 ## 项目是什么
 
-原文保真的记忆服务：`Add` 写入、`Search` 检索。FastAPI + SQLite（FTS5 + sqlite-vec）。embedding 默认走 DashScope `text-embedding-v4`（原生 text-embedding API，2048 维），reranker 默认由本机 llama.cpp 提供 cross-encoder 精排。**不生成答案，只返回可回溯到原文的证据片段。**
+原文保真的记忆服务：`Add` 写入、`Search` 检索。FastAPI + SQLite（FTS5 + sqlite-vec）。**所有模型调用都是远程 HTTP API**：embedding 默认 DashScope `text-embedding-v4`（原生 text-embedding API，2048 维），reranker 默认 DashScope `qwen3-rerank`（原生 text-rerank API）。进程内不加载模型、不需要 GPU、不需要本地推理服务。**不生成答案，只返回可回溯到原文的证据片段。**
 
-## 当前部署状态（2026-10-20 起）
+## 当前形态（2026-11-02 起：纯 API）
 
-**两个常驻进程 + 一个远程模型**：
+**一个常驻进程，两个远程模型端点**：
 - memorysum `:8001`（FastAPI 服务）
-- reranker `:7997`（`bge-reranker-v2-m3-F16`，官方 llama.cpp，`--reranking --pooling rank`，**`--cache-ram 0`**）
-- embedding：阿里云 DashScope `text-embedding-v4`（原生 text-embedding API，**2048 维**，
-  `embedding.provider = "dashscope"`），通过 HTTPS 调用专用 MaaS 端点
-  `https://llm-5qr9sf5t4nflguf4.cn-beijing.maas.aliyuncs.com`；密钥用 `DASHSCOPE_API_KEY`
-  （或 `MEMORYSUM_DASHSCOPE_API_KEY`），端点用 `MEMORYSUM_DASHSCOPE_BASE_URL` 覆盖。
-- 本机 `:7999` 的 `Qwen3-Embedding-4B-Q8_0` 只作为回退路径保留（`provider = "local-openai"`）。
+- embedding：DashScope `text-embedding-v4`（`embedding.provider = "dashscope"`，2048 维）
+- rerank：DashScope `qwen3-rerank`（`reranker.provider = "dashscope"`）
+- 凭据：`DASHSCOPE_API_KEY`（或 `MEMORYSUM_DASHSCOPE_API_KEY`）；端点用
+  `MEMORYSUM_DASHSCOPE_BASE_URL` 覆盖。公共端点实测会忽略 `dimension` 返回 1024 维，
+  用专用 MaaS 部署时把 base URL 指过去（见「踩过的坑」第 52 条）。
+- 另一家可选远程供应商：`openrouter`（OpenAI 兼容 `/embeddings` + `/rerank`），两段可混用。
 
-> **本机模型服务（reranker；以及回退时的本地 embedding）必须带 `--cache-ram 0` 启动**（2026-10-16）。llama.cpp 的 prompt cache 对
-> BERT/embedding 这类非 causal pooling 模型**永不淘汰**（state 大小恒为 0 → 容量上限失效；
-> `size_per_token` 被 `max(1.0, 0/n_tokens)` 钉在 1.0 → token 上限被放大成 8.6e9），
-> 每处理一条输入就永久留存一条，且每个任务都要全表扫一遍。实测：rerank 连续跑 24h、
-> 处理 ~77.6 万条文档后**退化 4.4 倍**（同样 100 条文档：23.0s vs 新实例 5.2s；16 条小文档
-> 2.9s vs 71ms），RSS 从 4.3GB 涨到 9.8GB；embedding 服务 1 token 输入要 740ms（新实例 17ms）。
-> 见「踩过的坑」第 50 条与 `docs/session-2026-10-16-server-degradation.md`。
+> **本仓库不再包含任何本地模型部署路径**：`providers/local_openai.py` 已删除，
+> `MEMORYSUM_EMBEDDING_BASE_URL` / `MEMORYSUM_RERANK_BASE_URL` / `MEMORYSUM_*_API_KEY`
+> 已移除。不要再把 llama.cpp / vLLM / LM Studio 之类的本机端点加回来——那会让
+> "开源即用"变成"先装模型"，而且本地服务的性能陷阱（prompt cache 永不淘汰、`-ub` 隐形上限）
+> 全是部署方的负担。要接新供应商，就在 `providers/` 下写一个远程 HTTP 适配器并在
+> `factory.py` 登记。
 
 **已回退的改动**（历史记录，不在当前版本）：
+- 本机 llama.cpp 模型服务（embedding `:7999` + reranker `:7997`）→ 2026-11-02 全部下线，改纯 API
 - jina-reranker-v3.5（fork llama.cpp + projector MLP + rerank_server.py）→ 已回退到 bge
 - qinstr2（新 query instruction）→ 已回退；当前 `text-embedding-v4` 用空指令
   （`embedding.query_instruction = ""`，代码对空指令不再拼 `"\n\n"`）
@@ -34,11 +34,16 @@
 ## 环境与运行
 
 - Python 3.12（`>=3.12,<3.13`），虚拟环境在 `.venv/`
+- 只需要一个进程 + 一个模型 API key，没有本地模型服务要起：
+  ```bash
+  export DASHSCOPE_API_KEY='sk-...'            # 唯一必需的外部凭据
+  .venv/bin/memorysum                          # :8001
+  ```
 - 常用命令（**都用 `.venv/bin/*`，不要用 `uv run`**）：
   ```bash
   .venv/bin/python -m pytest -q
   .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
-  .venv/bin/python scripts/eval_retrieval.py          # 检索质量评测（见下）
+  .venv/bin/python scripts/eval_retrieval.py          # 检索质量评测（见下，需 DashScope key）
   ```
 - **禁止 `uv run` / `uv sync --frozen`**：uv.lock 记录的是被墙的 `files.pythonhosted.org` 绝对 URL，会卡死。安装依赖用
   `UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple uv pip install -e ".[dev]"`。
@@ -62,6 +67,9 @@
      不要写成"平台确认 X"：文档声明与实际行为可能不一致，**能实测的仍以实测为准**。
      工具 `scripts/fetch_platform_results.py`，口径与原文摘录见
      [docs/platform-api-notes.md](docs/platform-api-notes.md)。
+6. **模型只走远程 API**：新增供应商只能是在 `providers/` 下实现的远程 HTTP 适配器并在
+   `providers/factory.py` 登记；不得在进程内加载模型，不得引入隐式本机端点或本地回退。
+   缺 key、超时、限流都要返回非 2xx（`model_provider_*` code），不能静默降级到纯词法。
 
 ## 改排序/检索后必须做的验证
 
@@ -87,6 +95,12 @@
 txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见第 32、33 条）。
 
 ## 踩过的坑（都已实测，别重复尝试）
+
+> **历史说明（2026-11-02）**：下面带 `llama.cpp` / `-ub` / `:7997` / `:7999` 的条目，记录的是
+> 2026-10 自建本机模型时期（embedding + reranker 都跑在本机 llama.cpp 上）的实测。当前版本**只用远程 API**，
+> 这些条目不再描述运行中的系统，但保留下来是因为它们解释了若干设计选择（预算为什么保守、
+> 为什么必须校验响应维度、为什么不要用"换更强小模型"解题）。任何与本文件顶部
+> 「当前形态」冲突的段落，**以顶部为准**。
 
 5. ~~**`rrf_k` 调参无效**：10 / 20 / 30 / 60 / 100 / 200 六个值下 top-1 与 top-3 完全相同（RRF 的已知鲁棒性）。保持 60。~~
    **（2026-10-15 推翻）** 那次是在**旧判据**（txt 头部匹配、没有 ids 口径、没有 split-half）下测的，
@@ -130,7 +144,7 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
 25. **它唯一可用的能力是 `cite`（定位证据句）**：返回逐字片段 + 字符偏移 + 概率，概率是有效质量信号（>0.9 基本对，<0.3 基本噪声），人工核对 15 题里 10 题完美或相关。已集成成 `evidence_purify`（默认关，见 `core/evidence.py`），机制是给前 N 条记录加 `[Key evidence: …]` 前缀、原文完整保留。**六层失败即原样返回**，其中最关键的一层是"引用必须能在该条原文里逐字找到"——它让幻觉 span 无法进入响应。实测（LoCoMo 4 对话 320 题）：答题准确率 26.9% → 27.8%，+3 题（赢 7 输 4），**McNemar p=0.549 不显著**，收益全部来自 temporal 类。**注意：改 config 打开它必须重启服务才生效**（进程内没有调用代码时改配置无用）。
 26. **LLM judge 的噪声是系统性的，不是随机的**：同一输入重复判 5 次结果稳定，但语义相同的不同表述会判出相反结论（gold=`Oliver, Luna, Bailey` 时 `Luna and Oliver` 判对而 `Oliver and Luna` 判错）——**投票治不了**。必须"规则优先 + LLM 兜底"：gold 是列表就要求元素全中、含数字就要求数字全中并做数字词映射（four→4、twice→2）、明确说不知道直接判错，其余才交给 LLM。规则命中率 85% 时判定才稳定。**代价是绝对数字大降**：同一批题从宽松 LLM judge 的 62.5% 掉到真实的 26.9%，旧的虚高数字不能用来汇报。参考实现见 `/home/rain/bench/judge_v2.py`。
 27. **统计功效**：40 题的 A/B 只能检测 >8% 的效应，"赢 2 输 2"无法区分有无；**+2% 需要约 1500 题**，+5% 需要约 300 题。配对设计看的是"赢/输比例是否显著偏离 1:1"（McNemar），不是净值 —— 即使拿到"赢 10 输 8"也不显著（p≈0.81）。
-28. **rerank 服务的 `-ub` 是隐形上限，压测里的 503 就是它**：`--pooling rank` 让 `slot.can_split()` 为 false，**每对 (query, document) 必须整体进一个物理 batch**，超了 llama.cpp 直接 500：`input (3648 tokens) is too large to process. increase the physical batch size (current batch size: 2048)`。而 `champion-v1.json` 的 `reranker.single_pair_proxy_tokens` 才是管线以为的上限 → 服务端参数与配置不一致，等于静默丢了能力。2026-10-14 压测：`-ub 2048` + 一条 9050 字符 query（pair 3648 token）→ 失败被重试 23 次、每次卡 3027 ms 后 503；`-ub 8192` 后同一请求 200/289 ms。**启动参数必须满足 `-ub ≥ 单对预算的最坏真实长度`**（llama.cpp 会把 `-c` 压回模型训练窗口 8192 并告警，所以 8192 就是天花板；实测 `-ub 16384` 只多占 576MB 显存、没有任何收益）。
+28. **rerank 服务的 `-ub` 是隐形上限，压测里的 503 就是它**：`--pooling rank` 让 `slot.can_split()` 为 false，**每对 (query, document) 必须整体进一个物理 batch**，超了 llama.cpp 直接 500：`input (3648 tokens) is too large to process. increase the physical batch size (current batch size: 2048)`。而 `champion-v1.json` 的 `reranker.single_pair_proxy_tokens` 才是管线以为的上限 → 服务端参数与配置不一致，等于静默丢了能力。2026-10-14 压测：`-ub 2048` + 一条 9050 字符 query（pair 3648 token）→ 失败被重试 23 次、每次卡 3027 ms 后 503；`-ub 8192` 后同一请求 200/289 ms。**（自建 reranker 时期）启动参数必须满足 `-ub ≥ 单对预算的最坏真实长度`**（llama.cpp 会把 `-c` 压回模型训练窗口 8192 并告警，所以 8192 就是天花板；实测 `-ub 16384` 只多占 576MB 显存、没有任何收益）。当前改走托管 API 后，这条只解释为什么预算要保守：单条上限由服务端声明（qwen3-rerank 为 4,000 token/item）。
 29. **代理分词器会低估真实 token，方向还很反直觉**：`reader_token_count()`（tiktoken cl100k）与 `bge-reranker-v2-m3` 的 XLM-R sentencepiece 实测（`scripts/calibrate_rerank_tokens.py`，1330 条真实 memory + 对抗样本）：中位 1.166、p99 1.357、**最坏 1.479**——**低估在英文/URL/标点那侧**（URL/UUID 1.479、标点密集 1.334），中日韩俄阿反而都 <0.7（中文 0.57）。所以 `single_pair_proxy_tokens` 从 8192 降到 **4608**（4608×1.479≈6814，留 17% 余量）；`max_query_proxy_tokens = 6144` 从硬编码搬进 config。换模型/tokenizer 后重跑标定脚本（不安全时非 0 退出）。**别名音：不要再用「低估约 3%」这种估算——3% 只是那种英文语料下的巧合值。**
 30. **并发长 pair 不是悬崖，但延迟会排队**：4×3570、6×3570、8×6970 token 并发（合计最高 55.7k，远超 8192 的 unified KV）实测全部 200，n_slots=4 下 p50 3.3s / max 5.8s。所以修掉单对上限后不需要为此再限并发。
 31. **候选全部超预算不能返回空数组**：旧代码在 `entries` 为空时直接返回 `data=[]`（靠「query 上限 + 预算」两个常量凑巧不冲突才没爆），一旦 query 变长就会让调用方以为「没有相关记忆」。现在退回融合排序（策略 `hybrid_retrieval_unreranked` + WARNING），证据照常返回。
@@ -207,7 +221,7 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
     `alloc()` / `load()` 对**每个任务都要全表扫一遍缓存**（`get_common_prefix` 逐条比 token）→
     成本随历史任务数线性增长。量化：rerank 连续跑 24h / 77.6 万条文档后，同样 100 条文档
     **23.0s vs 新实例 5.2s（4.4 倍）**；16 条 10-token 小文档 2.9s vs 71ms（**41 倍**）；
-    RSS 4.3GB → 9.8GB。**修复 = 重启 + 启动参数加 `--cache-ram 0`**（禁用 prompt cache，
+    RSS 4.3GB → 9.8GB。**（历史）修复 = 重启 + 启动参数加 `--cache-ram 0`**（禁用 prompt cache，
     对 rerank/embedding 没有损失：实测新实例 100 条文档仍是 5.2s）。重启后单条 search 的
     rerank 段 8.1s → 1.1s（离线复现 8.53s → 1.53s）。**判定「模型是否在 GPU 上」别只看 GPU 占用**：
     两个服务都 `-ngl 99`、llama-bench 也是 GPU 15.9k tok/s vs CPU 6.6k，问题从来不在卡上。
@@ -253,7 +267,8 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
 ## 本机环境的坑
 
 - **GitHub push 间歇性完全不通**：单次命令常失败（`GnuTLS recv error (-110)` 或 135 s 连接超时）。必须写成**重试循环**（实测第 4-6 次才通，成功时仅 2-4 秒）。`git ls-remote`（只读）通常 1 秒成功，可用它区分"网络不通"与"认证失败"。
-- **HF 下载同理**：`export HF_ENDPOINT=https://hf-mirror.com` 后 `hf download` 或 `wget -c`（支持断点续传），必须带重试；直连 huggingface.co 基本不通。
+- **HF 下载同理（仅历史需要）**：当前版本不下载任何模型，此条不再适用；若将来访问 HF，
+  `export HF_ENDPOINT=https://hf-mirror.com` 后 `hf download` 或 `wget -c` 必须带重试。
 - **重启服务前先看活动连接**：`ss -tn state established '( sport = :8001 )'`。有 keep-alive 连接时 uvicorn 会等满超时（实测停机 10.9 s）；无连接时 ~0.16 s。要么等连接空闲，要么 SIGTERM 后 2 秒直接 SIGKILL（~0.2 s）。**用户要求尽量别让服务停太久。**
 - **`pkill -f '<pattern>'` 会杀掉执行它的 shell 自身**（pattern 出现在自己的命令行里，实测 exit 143）→ 用 `ps -eo pid,args | grep -F ... | grep -v grep | awk '{print $1}'` 取 PID，或 `pkill -x <进程名>`。
 - **后台任务用 `setsid`**：`nohup` 只挡 SIGHUP，工具调用超时的 SIGTERM 会带走子进程。
@@ -268,7 +283,8 @@ txt1 47~49、ids1 37~39；更早的「txt1 38、MRR 0.73」是旧判据（详见
   [ "$NEW" != "$REAL" ] && echo "真的换了进程 ✅" || echo "没重启成功 ❌"
   ```
   停机实测 4.5~6.0 s（有平台 keep-alive 连接时）。
-- **四种服务都是裸进程**，机器重启不自动恢复（尚无 systemd unit）；memorysum 依赖 7999/7997 可达，否则 Add/Search 返回 503。
+- **只有 memorysum 一个常驻进程**，机器重启不自动恢复（尚无 systemd unit）。模型调用走远程 API，
+  所以 8001 起得来就能服务；模型侧不可达时 Add/Search 返回 503，不会本地兜底。
 - **日志时间戳是 UTC（带 Z），与本地时间差 8 小时**：专家说「14:26 出 400」要在日志里查 `T06:26`——排查时间点先转换（2026-10-15 实测确认）。
 - **外网入口验证用 check-host.net**（`https://check-host.net/check-tcp?host=...` API）：本机 curl 外网地址不通很可能只是 hairpin NAT（路由器不回环转发），不代表外网不可达——2026-10-15 实测 4 探针节点 3 通 0.4-1.3s。
 - **读压测/评测日志别用"就近的 http_request 行"配对结构化事件**：Add/Search 的 `api_*` 事件行与 uvicorn 的 `http_request` 行是并发交错的，实测会把 Add 的 payload 配到 Search 的状态码上。**按 `trace_id` 关联**才对（工具：`scripts/extract_loadtest_requests.py`）。另外 `api_*` 事件行只在 `MEMORYSUM_DEBUG` 打开时才写。

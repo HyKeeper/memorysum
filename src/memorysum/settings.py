@@ -10,7 +10,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr, model_validator
 
 
 class FrozenConfig(BaseModel):
@@ -56,10 +56,11 @@ class RerankerConfig(FrozenConfig):
     model: str
     instruction: str
     #: 单条 (query, document) 的代理 token 预算（cl100k 估算值）。必须是**保守值**：
-    #: 真实口径是 llama.cpp 的 XLM-R 分词器，实测最坏 real/est = 1.494，所以预算×1.75
-    #: 仍小于服务端硬上限（模型训练窗口 8192）才算安全。见 README「服务编排」。
+    #: 代理计数会低估真实 token（实测最坏 real/est ≈ 1.5），预算 ×1.5 仍要小于服务端
+    #: 单条上限（DashScope qwen3-rerank 为 4,000 token/item）才算安全。见 README「Rerank 后端」。
     single_pair_proxy_tokens: int
-    #: query(+options) 的代理 token 上限，超过直接 422；目前只作为荒谬输入的护栏。
+    #: query(+options) 的代理 token 上限。超过时 query 会被裁成首尾两段再送去精排，
+    #: 不返回 422（超长 query 仍然要交出证据）；与单条上限一起受服务端 4,000 token/item 约束。
     max_query_proxy_tokens: int
     ordinary_pair_proxy_budget: int
     wide_pair_proxy_budget: int
@@ -127,10 +128,14 @@ class RetrievalConfig(FrozenConfig):
 
 
 class EvidencePurifyConfig(FrozenConfig):
-    """Optional THX-01 evidence purification (see core/evidence.py). Off by default."""
+    """Optional evidence purification via an external decision API (see core/evidence.py).
+
+    Off by default, and there is no implicit endpoint: enabling it requires naming a
+    reachable HTTP endpoint in the pipeline config.
+    """
 
     enabled: bool = False
-    endpoint: str = "http://127.0.0.1:8095/v1/decide"
+    endpoint: str = ""
     #: Only the first N records are considered.
     max_records: int = 3
     #: A citation must clear both thresholds to be used.
@@ -139,6 +144,12 @@ class EvidencePurifyConfig(FrozenConfig):
     #: The state sent to the decision service is truncated to this many characters.
     max_state_chars: int = 1000
     timeout_seconds: float = 15.0
+
+    @model_validator(mode="after")
+    def _require_endpoint_when_enabled(self) -> EvidencePurifyConfig:
+        if self.enabled and not self.endpoint.strip():
+            raise ValueError("evidence_purify.endpoint is required when the feature is enabled")
+        return self
 
 
 class GroupConfig(FrozenConfig):
@@ -231,6 +242,11 @@ class PipelineConfig(FrozenConfig):
 
 @dataclass(frozen=True)
 class RuntimeSettings:
+    """Environment-only settings: data locations, inbound auth, provider endpoints.
+
+    Every model call goes to a hosted HTTP API; there are no local model endpoints.
+    """
+
     data_root: Path
     openrouter_base_url: str
     openrouter_api_key: SecretStr | None
@@ -239,10 +255,6 @@ class RuntimeSettings:
     host: str
     port: int
     debug: bool = False
-    embedding_base_url: str = "http://127.0.0.1:7999/v1"
-    embedding_api_key: SecretStr | None = None
-    rerank_base_url: str = "http://127.0.0.1:7997"
-    rerank_api_key: SecretStr | None = None
     #: DashScope native API host (provider "dashscope"). Point this at the dedicated
     #: MaaS deployment when the account uses one; the public endpoint was observed
     #: ignoring the requested dimension (see providers/dashscope.py).
@@ -283,8 +295,6 @@ class RuntimeSettings:
         debug = debug_value in {"1", "true", "yes", "on"}
 
         api_key = os.getenv("OPENROUTER_API_KEY")
-        embedding_api_key = os.getenv("MEMORYSUM_EMBEDDING_API_KEY")
-        rerank_api_key = os.getenv("MEMORYSUM_RERANK_API_KEY")
         # DashScope's own CLI convention is DASHSCOPE_API_KEY; the namespaced variable
         # wins so one process can keep separate credentials for separate services.
         dashscope_api_key = os.getenv("MEMORYSUM_DASHSCOPE_API_KEY") or os.getenv(
@@ -301,14 +311,6 @@ class RuntimeSettings:
             host=os.getenv("MEMORYSUM_HOST", "0.0.0.0"),
             port=8001,
             debug=debug,
-            embedding_base_url=os.getenv(
-                "MEMORYSUM_EMBEDDING_BASE_URL", "http://127.0.0.1:7999/v1"
-            ).rstrip("/"),
-            embedding_api_key=SecretStr(embedding_api_key) if embedding_api_key else None,
-            rerank_base_url=os.getenv("MEMORYSUM_RERANK_BASE_URL", "http://127.0.0.1:7997").rstrip(
-                "/"
-            ),
-            rerank_api_key=SecretStr(rerank_api_key) if rerank_api_key else None,
             dashscope_base_url=os.getenv(
                 "MEMORYSUM_DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com"
             ).rstrip("/"),

@@ -17,7 +17,12 @@ QUESTION = "When did Melanie run a charity race?"
 
 
 def _cfg(**kw) -> EvidencePurifyConfig:
-    base = {"enabled": True, "min_probability": 0.85, "min_chars": 15}
+    base = {
+        "enabled": True,
+        "endpoint": "https://decision.example/v1/decide",
+        "min_probability": 0.85,
+        "min_chars": 15,
+    }
     base.update(kw)
     return EvidencePurifyConfig(**base)
 

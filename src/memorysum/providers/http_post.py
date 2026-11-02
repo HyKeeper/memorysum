@@ -1,9 +1,9 @@
-"""Bounded-retry JSON POST shared by HTTP model providers.
+"""Bounded-retry JSON POST shared by the hosted model providers.
 
-`local_openai` and `dashscope` both need the same failure taxonomy: timeouts,
-connection failures, retryable 5xx/429, deterministic "input too large" answers
-and a stable `ProviderError` code for every branch. Keeping one implementation
-means a new provider cannot silently drift into different retry semantics.
+Every provider needs the same failure taxonomy: timeouts, connection failures,
+retryable 5xx/429, deterministic "input too large" answers and a stable
+`ProviderError` code for every branch. Keeping one implementation means a new
+provider cannot silently drift into different retry semantics.
 
 The helpers never log request bodies or credentials; only the provider's own
 error message is quoted.
@@ -25,13 +25,13 @@ logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
-#: llama.cpp rejects a prompt that does not fit in one physical batch, or in the slot
-#: context, with HTTP 500. The prompt is simply too long for the model - retrying cannot
-#: help, and waiting 1 s + 2 s for the same rejection burns the caller's deadline (measured
-#: on 2026-10-14: every failed Search stalled for 3027 ms and then returned 503).
-#: The pipeline's own budget (`reranker.single_pair_proxy_tokens`) is a *proxy* estimate and
-#: deliberately conservative; `reranker -ub` must cover its worst-case real length (see the
-#: calibration table in README「服务拓扑」).
+#: Some serving stacks answer an oversized input with HTTP 5xx and one of these messages
+#: (self-hosted cross-encoder servers do; a hosted API is more likely to answer 4xx, which
+#: is never retried either). The rejection is deterministic, so retrying only burns the
+#: caller's deadline: measured 2026-10-14, every failed Search stalled ~3 s before 503.
+#: The pipeline's own budgets (`reranker.single_pair_proxy_tokens`,
+#: `reranker.max_query_proxy_tokens`) are deliberately conservative so this branch should
+#: stay unreachable in normal operation.
 CAPACITY_ERROR_MARKERS = (
     "too large to process",
     "larger than the max context size",

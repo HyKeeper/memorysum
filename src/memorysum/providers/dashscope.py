@@ -1,7 +1,10 @@
-"""Alibaba Cloud DashScope embedding provider (`text-embedding-v4`).
+"""Alibaba Cloud DashScope model provider (embeddings + reranking).
 
-Wire format is the native DashScope synchronous embedding API, **not** the
-OpenAI-compatible `/v1/embeddings` dialect:
+Both stages use DashScope's **native** synchronous APIs, not the
+OpenAI-compatible dialects. One API key and one base URL serve the whole
+pipeline, so a deployment needs no local model process at all.
+
+Embeddings — ``text-embedding-v4``:
 
     POST {base}/api/v1/services/embeddings/text-embedding/text-embedding
     Authorization: Bearer $DASHSCOPE_API_KEY
@@ -12,18 +15,36 @@ OpenAI-compatible `/v1/embeddings` dialect:
     -> {"output": {"embeddings": [{"text_index": 0, "embedding": [...]}]},
         "usage": {"total_tokens": 23}, "request_id": "..."}
 
-Documented limits (checked against the live endpoint on 2026-10-20):
-at most 10 inputs per request, each input up to 8,192 tokens. The dimension must
-be one of 64/128/256/512/768/1024/1536/2048/3072; omitting it silently yields the
-1024-dimension default, which is why `embedding.dimension` is required and the
-response is checked against it.
+Reranking — ``qwen3-rerank``:
 
-Measured on 2026-10-20: `https://dashscope.aliyuncs.com` answered a
-`"dimension": 2048` request with **1024-d vectors** (the parameter was ignored),
-while the dedicated MaaS endpoint
-`https://llm-5qr9sf5t4nflguf4.cn-beijing.maas.aliyuncs.com` honoured it. This
-provider therefore refuses a mismatched dimension instead of silently writing a
-different embedding space into the scope database.
+    POST {base}/api/v1/services/rerank/text-rerank/text-rerank
+    {"model": "qwen3-rerank",
+     "input": {"query": "...", "documents": ["...", "..."]},
+     "parameters": {"return_documents": false, "top_n": 2}}
+
+    -> {"output": {"results": [{"index": 0, "relevance_score": 0.93}]},
+        "usage": {"total_tokens": 79}, "request_id": "..."}
+
+``relevance_score`` is relative to the request (0-1, higher = more relevant);
+the search pipeline only consumes the induced *ranking*, never the absolute
+score, so per-request normalisation is harmless.
+
+Documented limits (checked against the live endpoint on 2026-10-20 for the
+embedding API, 2026-11-02 for rerank):
+
+* embeddings: at most 10 inputs per request, 8,192 tokens per input, dimension
+  one of 64/128/256/512/768/1024/1536/2048/3072;
+* rerank: at most 500 documents per request, 4,000 tokens per item (query or
+  document), and the request total
+  ``query_tokens * n_documents + document_tokens`` must stay under the model's
+  per-request budget.
+
+Omitting ``dimension`` silently yields the 1024-dimension default at the
+public endpoint, and the public endpoint was measured ignoring an explicit
+``"dimension": 2048`` (returning 1024-d vectors) while the dedicated MaaS
+endpoint honoured it. This provider therefore requires an explicit dimension
+and refuses any response whose vectors do not match it, instead of silently
+writing a different embedding space into the scope database.
 """
 
 from __future__ import annotations
@@ -43,15 +64,19 @@ from memorysum.settings import PipelineConfig, RuntimeSettings
 #: Dimensions accepted by text-embedding-v4 (probed against the live endpoint).
 SUPPORTED_DIMENSIONS = frozenset({64, 128, 256, 512, 768, 1024, 1536, 2048, 3072})
 
-#: Hard server limit: one request carries at most 10 inputs.
+#: Hard server limit: one embedding request carries at most 10 inputs.
 MAX_BATCH_ITEMS = 10
 
-_PATH = "api/v1/services/embeddings/text-embedding/text-embedding"
+#: Hard server limit: one rerank request carries at most 500 documents.
+MAX_RERANK_DOCUMENTS = 500
+
+_EMBEDDING_PATH = "api/v1/services/embeddings/text-embedding/text-embedding"
+_RERANK_PATH = "api/v1/services/rerank/text-rerank/text-rerank"
 _CONCURRENCY = 8
 
 
-class DashScopeEmbeddingProvider:
-    """Dense embeddings served by DashScope's native text-embedding API."""
+class DashScopeProvider:
+    """Embeddings and reranking served by DashScope's native HTTP APIs."""
 
     def __init__(
         self,
@@ -80,6 +105,8 @@ class DashScopeEmbeddingProvider:
                 f"embedding.batch_items={embedding.batch_items} exceeds the DashScope "
                 f"limit of {MAX_BATCH_ITEMS} inputs per request"
             )
+        if pipeline.reranker.enabled and not pipeline.reranker.model.strip():
+            raise ValueError("reranker.model must name a DashScope rerank model")
         self._client = httpx.Client(
             base_url=runtime.dashscope_base_url.rstrip("/") + "/",
             timeout=httpx.Timeout(
@@ -91,6 +118,7 @@ class DashScopeEmbeddingProvider:
             transport=transport,
         )
         self._embedding_slots = threading.BoundedSemaphore(_CONCURRENCY)
+        self._rerank_slots = threading.BoundedSemaphore(pipeline.reranker.max_concurrency)
 
     def close(self) -> None:
         self._client.close()
@@ -113,7 +141,7 @@ class DashScopeEmbeddingProvider:
         with self._embedding_slots:
             body = post_json(
                 self._client,
-                _PATH,
+                _EMBEDDING_PATH,
                 payload,
                 attempts=self._pipeline.capacity.model_request_attempts,
                 headers=self._request_headers(),
@@ -128,11 +156,38 @@ class DashScopeEmbeddingProvider:
         return self._parse_embeddings(body, len(texts))
 
     def rerank(self, query: str, documents: Sequence[str]) -> list[RerankScore]:
-        raise ProviderError(
-            "model_provider_not_configured",
-            "The DashScope embedding provider does not implement reranking.",
-            status_code=503,
-        )
+        if not documents:
+            return []
+        if len(documents) > MAX_RERANK_DOCUMENTS:
+            raise ProviderError(
+                "model_provider_invalid_rerank",
+                f"The rerank batch has {len(documents)} documents; DashScope accepts at most "
+                f"{MAX_RERANK_DOCUMENTS}.",
+                status_code=503,
+            )
+        payload: dict[str, Any] = {
+            "model": self._pipeline.reranker.model,
+            "input": {"query": query, "documents": list(documents)},
+            # Request every document back: scoring a strict subset would silently drop
+            # candidates. `return_documents=false` keeps the response small.
+            "parameters": {"return_documents": False, "top_n": len(documents)},
+        }
+        with self._rerank_slots:
+            body = post_json(
+                self._client,
+                _RERANK_PATH,
+                payload,
+                attempts=self._pipeline.capacity.model_request_attempts,
+                headers=self._request_headers(),
+                what="DashScope rerank",
+            )
+        if not isinstance(body, dict):
+            raise ProviderError(
+                "model_provider_invalid_rerank",
+                "The reranker returned an invalid response.",
+                status_code=503,
+            )
+        return self._parse_rerank(body, len(documents))
 
     def _request_headers(self) -> dict[str, str]:
         api_key = self._runtime.dashscope_api_key
@@ -214,3 +269,49 @@ class DashScopeEmbeddingProvider:
             indexed[index] = parsed
 
         return [indexed[index] for index in range(expected)]
+
+    @staticmethod
+    def _parse_rerank(body: dict[str, Any], expected: int) -> list[RerankScore]:
+        output = body.get("output")
+        entries = output.get("results") if isinstance(output, dict) else None
+        if not isinstance(entries, list) or len(entries) != expected:
+            raise ProviderError(
+                "model_provider_invalid_rerank",
+                "The reranker returned an incomplete result set.",
+                status_code=503,
+            )
+        parsed: list[RerankScore] = []
+        seen: set[int] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ProviderError(
+                    "model_provider_invalid_rerank",
+                    "The reranker returned an invalid result.",
+                    status_code=503,
+                )
+            index = entry.get("index")
+            score = entry.get("relevance_score", entry.get("score"))
+            if (
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+                or index >= expected
+                or index in seen
+                or not isinstance(score, (int, float))
+                or isinstance(score, bool)
+                or not math.isfinite(float(score))
+            ):
+                raise ProviderError(
+                    "model_provider_invalid_rerank",
+                    "The reranker returned an invalid score or index.",
+                    status_code=503,
+                )
+            seen.add(index)
+            parsed.append(RerankScore(index=index, score=float(score)))
+        if len(seen) != expected:
+            raise ProviderError(
+                "model_provider_invalid_rerank",
+                "The reranker returned duplicate or missing indexes.",
+                status_code=503,
+            )
+        return parsed
